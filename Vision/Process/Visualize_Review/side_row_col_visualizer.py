@@ -23,10 +23,14 @@ SIDE_LABELS = {
     "BB": "BB / BBottom",
 }
 SIDE_GRID_SHAPES = {
-    "BL": (2, 30),
-    "BR": (2, 30),
+    "BL": (31, 2),
+    "BR": (31, 2),
     "BT": (2, 20),
     "BB": (2, 20),
+}
+SIDE_AUTO_BASES = {
+    "BL": (0, 0),
+    "BR": (0, 0),
 }
 
 ENCODINGS = ("utf-8-sig", "utf-8", "cp949", "euc-kr")
@@ -337,8 +341,17 @@ def normalize_records(
     for side in VALID_SIDES:
         side_records = [record for record in records if record.side == side]
         row_limit, col_limit = SIDE_GRID_SHAPES[side]
-        row_base = infer_base((record.row_value for record in side_records), row_limit, row_base_mode)
-        col_base = infer_base((record.col_value for record in side_records), col_limit, col_base_mode)
+        default_row_base, default_col_base = SIDE_AUTO_BASES.get(side, (None, None))
+        row_base = (
+            default_row_base
+            if row_base_mode == "auto" and default_row_base is not None
+            else infer_base((record.row_value for record in side_records), row_limit, row_base_mode)
+        )
+        col_base = (
+            default_col_base
+            if col_base_mode == "auto" and default_col_base is not None
+            else infer_base((record.col_value for record in side_records), col_limit, col_base_mode)
+        )
         inferred_bases[side] = (row_base, col_base)
 
         for record in side_records:
@@ -401,15 +414,20 @@ class HeatmapGrid(ttk.Frame):
         self.counts = [[0 for _ in range(self.cols)] for _ in range(self.rows)]
         self.total = 0
         self.max_value = 0
+        self.row_label_base = 0
+        self.col_label_base = 0
 
         self.title_var = tk.StringVar(value=SIDE_LABELS[side])
         ttk.Label(self, textvariable=self.title_var, font=("", 11, "bold")).pack(anchor="w")
-        self.canvas = tk.Canvas(self, height=132, bg="#ffffff", highlightthickness=1, highlightbackground="#cbd5e1")
+        canvas_height = max(132, min(560, self.rows * 16 + 48))
+        self.canvas = tk.Canvas(self, height=canvas_height, bg="#ffffff", highlightthickness=1, highlightbackground="#cbd5e1")
         self.canvas.pack(fill="x", expand=True, pady=(5, 0))
         self.canvas.bind("<Configure>", lambda _event: self.draw())
 
-    def set_counts(self, counts: list[list[int]]) -> None:
+    def set_counts(self, counts: list[list[int]], row_label_base: int = 0, col_label_base: int = 0) -> None:
         self.counts = counts
+        self.row_label_base = row_label_base
+        self.col_label_base = col_label_base
         self.total = sum(sum(row) for row in counts)
         self.max_value = max((value for row in counts for value in row), default=0)
         self.title_var.set(f"{SIDE_LABELS[self.side]}    total={self.total}    max cell={self.max_value}")
@@ -431,13 +449,14 @@ class HeatmapGrid(ttk.Frame):
         font_size = max(6, min(10, int(cell_width * 0.42), int(cell_height * 0.45)))
 
         for col in range(self.cols):
-            if col == 0 or (col + 1) % 5 == 0 or col == self.cols - 1:
+            coord = col + self.col_label_base
+            if self.cols <= 5 or col == 0 or coord % 5 == 0 or col == self.cols - 1:
                 x = left_margin + (col + 0.5) * cell_width
-                self.canvas.create_text(x, 11, text=str(col + 1), fill="#475569", font=("", 8))
+                self.canvas.create_text(x, 11, text=str(coord), fill="#475569", font=("", 8))
 
         for row in range(self.rows):
             y = top_margin + (row + 0.5) * cell_height
-            self.canvas.create_text(20, y, text=f"R{row + 1}", fill="#475569", font=("", 9, "bold"))
+            self.canvas.create_text(20, y, text=f"R{row + self.row_label_base}", fill="#475569", font=("", 8, "bold"))
 
         for row in range(self.rows):
             for col in range(self.cols):
@@ -553,10 +572,18 @@ class SideDistributionApp(tk.Tk):
         grid_frame = ttk.Frame(root)
         grid_frame.pack(fill="both", expand=True, pady=(10, 0))
         self.grids = {side: HeatmapGrid(grid_frame, side) for side in VALID_SIDES}
-        for row_index, side in enumerate(("BL", "BR", "BT", "BB")):
-            grid_frame.rowconfigure(row_index, weight=1)
-            self.grids[side].grid(row=row_index, column=0, sticky="nsew", pady=(0, 8))
-        grid_frame.columnconfigure(0, weight=1)
+        placements = {
+            "BL": (0, 0),
+            "BR": (0, 1),
+            "BT": (1, 0),
+            "BB": (1, 1),
+        }
+        for row_index, weight in enumerate((4, 1)):
+            grid_frame.rowconfigure(row_index, weight=weight)
+        for column_index in range(2):
+            grid_frame.columnconfigure(column_index, weight=1)
+        for side, (row_index, column_index) in placements.items():
+            self.grids[side].grid(row=row_index, column=column_index, sticky="nsew", padx=(0, 8), pady=(0, 8))
 
     def _mapping_comboboxes(self) -> list[ttk.Combobox]:
         comboboxes: list[ttk.Combobox] = []
@@ -727,14 +754,16 @@ class SideDistributionApp(tk.Tk):
         if period is None:
             empty_counts = aggregate_counts([], date(2000, 1, 1), date(2000, 1, 1))
             for side in VALID_SIDES:
-                self.grids[side].set_counts(empty_counts[side])
+                row_base, col_base = SIDE_AUTO_BASES.get(side, (0, 0))
+                self.grids[side].set_counts(empty_counts[side], row_base, col_base)
             self.status_var.set("표시할 데이터가 없습니다.")
             return
 
         start_day, end_day = period
         counts = aggregate_counts(self.records, start_day, end_day)
         for side in VALID_SIDES:
-            self.grids[side].set_counts(counts[side])
+            row_base, col_base = self.inferred_bases.get(side, SIDE_AUTO_BASES.get(side, (0, 0)))
+            self.grids[side].set_counts(counts[side], row_base, col_base)
 
         period_label = start_day.isoformat() if start_day == end_day else f"{start_day.isoformat()} ~ {end_day.isoformat()}"
         total = sum(sum(sum(row) for row in side_counts) for side_counts in counts.values())
@@ -759,8 +788,8 @@ class SideDistributionApp(tk.Tk):
 
 def run_self_test() -> None:
     sample_rows = [
-        {"Date": "2026-05-01", "Side": "BL", "Row": "1", "Col": "1"},
-        {"Date": "2026-05-01 12:30:00", "Side": "BLeft", "Row": "2", "Col": "30"},
+        {"Date": "2026-05-01", "Side": "BL", "Row": "0", "Col": "0"},
+        {"Date": "2026-05-01 12:30:00", "Side": "BLeft", "Row": "30", "Col": "1"},
         {"Date": "2026/05/02", "Side": "BT", "Row": "1", "Col": "20"},
         {"Date": "20260502", "Side": "BBottom", "Row": "2", "Col": "1"},
         {"Date": "2026.05.02", "Side": "XX", "Row": "1", "Col": "1"},
@@ -771,7 +800,7 @@ def run_self_test() -> None:
     assert skipped["ignored_side"] == 1
     assert out_skipped["out_of_grid"] == 0
     assert counts["BL"][0][0] == 1
-    assert counts["BL"][1][29] == 1
+    assert counts["BL"][30][1] == 1
     assert counts["BT"][0][19] == 1
     assert counts["BB"][1][0] == 1
     print("self-test passed")

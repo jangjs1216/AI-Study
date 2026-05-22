@@ -198,7 +198,7 @@ class GroupCameraFeatureExplorer:
         self.df = pd.DataFrame()
         self.filtered_df = pd.DataFrame()
         self.numeric_features: list[str] = []
-        self.custom_terms: list[tuple[str, float]] = []
+        self.custom_terms: list[dict[str, object]] = []
         self.custom_metric_counter = 1
         self.artist_rows: dict[object, list[int]] = {}
         self.image_viewer = ImageViewer(root)
@@ -211,6 +211,7 @@ class GroupCameraFeatureExplorer:
         self.sort_var = tk.StringVar(value="group_camera")
         self.formula_feature_var = tk.StringVar()
         self.formula_weight_var = tk.StringVar(value="1.0")
+        self.formula_norm_var = tk.StringVar(value="zscore")
         self.formula_name_var = tk.StringVar(value="custom_metric")
         self.formula_text_var = tk.StringVar(value="항을 추가하세요.")
         self.threshold_var = tk.StringVar()
@@ -294,6 +295,15 @@ class GroupCameraFeatureExplorer:
 
         ttk.Label(formula_top, text="가중치").pack(side=tk.LEFT)
         ttk.Entry(formula_top, textvariable=self.formula_weight_var, width=10).pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(formula_top, text="정규화").pack(side=tk.LEFT)
+        self.formula_norm_combo = ttk.Combobox(
+            formula_top,
+            textvariable=self.formula_norm_var,
+            state="readonly",
+            width=12,
+            values=["zscore", "robust", "minmax", "none"],
+        )
+        self.formula_norm_combo.pack(side=tk.LEFT, padx=(6, 12))
         ttk.Button(formula_top, text="항 추가", command=self.add_formula_term).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(formula_top, text="선택 삭제", command=self.delete_selected_formula_terms).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(formula_top, text="전체 삭제", command=self.clear_formula_terms).pack(side=tk.LEFT, padx=(0, 18))
@@ -430,7 +440,8 @@ class GroupCameraFeatureExplorer:
             messagebox.showwarning("가중치 오류", "가중치는 유한한 숫자여야 합니다.")
             return
 
-        self.custom_terms.append((feature, weight))
+        norm = self.formula_norm_var.get() or "zscore"
+        self.custom_terms.append({"feature": feature, "weight": weight, "norm": norm})
         self.update_formula_display()
 
     def delete_selected_formula_terms(self) -> None:
@@ -455,13 +466,43 @@ class GroupCameraFeatureExplorer:
             return
 
         parts = []
-        for feature, weight in self.custom_terms:
+        for term in self.custom_terms:
+            feature = str(term["feature"])
+            weight = float(term["weight"])
+            norm = str(term["norm"])
             sign = "+" if weight >= 0 else "-"
             abs_weight = abs(weight)
-            text = f"{sign} {abs_weight:g} * {feature}"
+            text = f"{sign} {abs_weight:g} * {norm}({feature})"
             parts.append(text)
             self.term_listbox.insert(tk.END, text.lstrip("+ "))
         self.formula_text_var.set("custom = " + " ".join(parts).lstrip("+ "))
+
+    @staticmethod
+    def normalize_series(values: pd.Series, norm: str) -> pd.Series:
+        numeric = pd.to_numeric(values, errors="coerce").astype(float)
+        if norm == "none":
+            return numeric
+        if norm == "minmax":
+            vmin = numeric.min(skipna=True)
+            vmax = numeric.max(skipna=True)
+            denom = vmax - vmin
+            if not np.isfinite(denom) or abs(denom) < 1e-12:
+                return numeric * 0.0
+            return (numeric - vmin) / denom
+        if norm == "robust":
+            median = numeric.median(skipna=True)
+            q1 = numeric.quantile(0.25)
+            q3 = numeric.quantile(0.75)
+            iqr = q3 - q1
+            if not np.isfinite(iqr) or abs(iqr) < 1e-12:
+                return numeric * 0.0
+            return (numeric - median) / iqr
+
+        mean = numeric.mean(skipna=True)
+        std = numeric.std(skipna=True)
+        if not np.isfinite(std) or abs(std) < 1e-12:
+            return numeric * 0.0
+        return (numeric - mean) / std
 
     def apply_custom_metric(self) -> None:
         if self.df.empty:
@@ -480,11 +521,14 @@ class GroupCameraFeatureExplorer:
 
         values = pd.Series(0.0, index=self.df.index, dtype=float)
         missing_features = []
-        for feature, weight in self.custom_terms:
+        for term in self.custom_terms:
+            feature = str(term["feature"])
+            weight = float(term["weight"])
+            norm = str(term["norm"])
             if feature not in self.df.columns:
                 missing_features.append(feature)
                 continue
-            feature_values = pd.to_numeric(self.df[feature], errors="coerce")
+            feature_values = self.normalize_series(self.df[feature], norm)
             values = values.add(feature_values * weight, fill_value=0.0)
 
         if missing_features:
@@ -531,6 +575,7 @@ class GroupCameraFeatureExplorer:
         default_feature = self._default_feature(self.numeric_features)
         self.feature_var.set(default_feature)
         self.formula_feature_var.set(default_feature)
+        self.formula_norm_var.set("zscore")
         self.formula_name_var.set("custom_metric")
         self.threshold_var.set("")
         self.update_formula_display()

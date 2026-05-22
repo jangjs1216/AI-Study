@@ -15,6 +15,7 @@ import math
 import re
 import sys
 import tkinter as tk
+import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -31,6 +32,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
+from matplotlib import font_manager  # noqa: E402
 
 
 TRUE_DEFECT_KEYWORD = "진불스크래치"
@@ -54,6 +56,42 @@ DEFECT_COLORS = {
     "미세스크래치": "#ff7f0e",
     "기타": "#4c78a8",
 }
+
+KOREAN_FONT_CANDIDATES = [
+    "Malgun Gothic",
+    "맑은 고딕",
+    "NanumGothic",
+    "NanumBarunGothic",
+    "Noto Sans CJK KR",
+    "Noto Sans KR",
+    "AppleGothic",
+    "Arial Unicode MS",
+]
+
+
+def configure_korean_matplotlib_font() -> str | None:
+    """Configure matplotlib to render Korean labels on common OS setups."""
+    available = {font.name for font in font_manager.fontManager.ttflist}
+    selected = next((name for name in KOREAN_FONT_CANDIDATES if name in available), None)
+
+    if selected is None and sys.platform.startswith("win"):
+        for font_path in [
+            Path("C:/Windows/Fonts/malgun.ttf"),
+            Path("C:/Windows/Fonts/malgunbd.ttf"),
+            Path("C:/Windows/Fonts/NanumGothic.ttf"),
+        ]:
+            if font_path.exists():
+                font_manager.fontManager.addfont(str(font_path))
+                selected = font_manager.FontProperties(fname=str(font_path)).get_name()
+                break
+
+    if selected:
+        matplotlib.rcParams["font.family"] = selected
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    return selected
+
+
+KOREAN_FONT_FAMILY = configure_korean_matplotlib_font()
 
 
 def read_csv_flexible(path: Path) -> pd.DataFrame:
@@ -149,6 +187,7 @@ class ImageViewer:
 class GroupCameraFeatureExplorer:
     def __init__(self, root: tk.Tk, csv_path: Path | None = None, image_root: Path | None = None) -> None:
         self.root = root
+        self._configure_tk_font()
         self.root.title("Group/Camera Feature Explorer")
         self.root.geometry("1440x900")
 
@@ -173,6 +212,26 @@ class GroupCameraFeatureExplorer:
         self._build_layout()
         if csv_path is not None:
             self.load_csv(csv_path)
+
+    def _configure_tk_font(self) -> None:
+        if not KOREAN_FONT_FAMILY:
+            return
+        for font_name in [
+            "TkDefaultFont",
+            "TkTextFont",
+            "TkFixedFont",
+            "TkMenuFont",
+            "TkHeadingFont",
+            "TkCaptionFont",
+            "TkSmallCaptionFont",
+            "TkIconFont",
+            "TkTooltipFont",
+        ]:
+            try:
+                current_font = tkfont.nametofont(font_name)
+                current_font.configure(family=KOREAN_FONT_FAMILY)
+            except tk.TclError:
+                continue
 
     def _build_layout(self) -> None:
         top = ttk.Frame(self.root, padding=8)

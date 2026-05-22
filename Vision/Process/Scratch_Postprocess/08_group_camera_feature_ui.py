@@ -198,6 +198,8 @@ class GroupCameraFeatureExplorer:
         self.df = pd.DataFrame()
         self.filtered_df = pd.DataFrame()
         self.numeric_features: list[str] = []
+        self.custom_terms: list[tuple[str, float]] = []
+        self.custom_metric_counter = 1
         self.artist_rows: dict[object, list[int]] = {}
         self.image_viewer = ImageViewer(root)
 
@@ -207,6 +209,12 @@ class GroupCameraFeatureExplorer:
         self.group_filter_var = tk.StringVar(value="전체")
         self.camera_filter_var = tk.StringVar(value="전체")
         self.sort_var = tk.StringVar(value="group_camera")
+        self.formula_feature_var = tk.StringVar()
+        self.formula_weight_var = tk.StringVar(value="1.0")
+        self.formula_name_var = tk.StringVar(value="custom_metric")
+        self.formula_text_var = tk.StringVar(value="항을 추가하세요.")
+        self.threshold_var = tk.StringVar()
+        self.threshold_direction_var = tk.StringVar(value="상단 제거 (>=)")
         self.status_var = tk.StringVar(value="CSV를 로드하세요.")
 
         self._build_layout()
@@ -274,6 +282,45 @@ class GroupCameraFeatureExplorer:
         self.sort_combo.pack(side=tk.LEFT, padx=(6, 18))
         self.sort_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_plot())
 
+        formula_frame = ttk.LabelFrame(self.root, text="사용자 정의 지표", padding=(8, 6))
+        formula_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+
+        formula_top = ttk.Frame(formula_frame)
+        formula_top.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(formula_top, text="항 Feature").pack(side=tk.LEFT)
+        self.formula_feature_combo = ttk.Combobox(formula_top, textvariable=self.formula_feature_var, state="readonly", width=34)
+        self.formula_feature_combo.pack(side=tk.LEFT, padx=(6, 12))
+
+        ttk.Label(formula_top, text="가중치").pack(side=tk.LEFT)
+        ttk.Entry(formula_top, textvariable=self.formula_weight_var, width=10).pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Button(formula_top, text="항 추가", command=self.add_formula_term).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(formula_top, text="선택 삭제", command=self.delete_selected_formula_terms).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(formula_top, text="전체 삭제", command=self.clear_formula_terms).pack(side=tk.LEFT, padx=(0, 18))
+
+        ttk.Label(formula_top, text="지표명").pack(side=tk.LEFT)
+        ttk.Entry(formula_top, textvariable=self.formula_name_var, width=20).pack(side=tk.LEFT, padx=(6, 6))
+        ttk.Button(formula_top, text="지표 적용", command=self.apply_custom_metric).pack(side=tk.LEFT, padx=(0, 18))
+
+        ttk.Label(formula_top, text="Threshold").pack(side=tk.LEFT)
+        ttk.Entry(formula_top, textvariable=self.threshold_var, width=12).pack(side=tk.LEFT, padx=(6, 6))
+        self.threshold_direction_combo = ttk.Combobox(
+            formula_top,
+            textvariable=self.threshold_direction_var,
+            state="readonly",
+            width=16,
+            values=["상단 제거 (>=)", "하단 제거 (<=)"],
+        )
+        self.threshold_direction_combo.pack(side=tk.LEFT, padx=(0, 6))
+        self.threshold_direction_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_plot())
+        ttk.Button(formula_top, text="Threshold 적용", command=self.refresh_plot).pack(side=tk.LEFT)
+
+        formula_bottom = ttk.Frame(formula_frame)
+        formula_bottom.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+        self.term_listbox = tk.Listbox(formula_bottom, height=3, width=72, exportselection=False)
+        self.term_listbox.pack(side=tk.LEFT, fill=tk.X, expand=False, padx=(0, 8))
+        ttk.Label(formula_bottom, textvariable=self.formula_text_var, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
         main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
@@ -319,6 +366,28 @@ class GroupCameraFeatureExplorer:
         y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
 
+        ttk.Label(table_frame, text="Threshold 상단/하단 요약").pack(side=tk.TOP, anchor="w", pady=(8, 0))
+        threshold_columns = [
+            "scope",
+            "side",
+            "camera_mode",
+            "defect_type",
+            "count",
+            "rate_total",
+            "rate_within_type",
+            "mean",
+        ]
+        self.threshold_tree = ttk.Treeview(table_frame, columns=threshold_columns, show="headings", height=10)
+        for col in threshold_columns:
+            self.threshold_tree.heading(col, text=col)
+            width = 120
+            if col in {"scope", "defect_type"}:
+                width = 135
+            if col == "camera_mode":
+                width = 90
+            self.threshold_tree.column(col, width=width, minwidth=70, anchor="center")
+        self.threshold_tree.pack(side=tk.TOP, fill=tk.X)
+
         self.status_label = ttk.Label(self.root, textvariable=self.status_var, anchor="w", padding=(8, 2))
         self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -341,6 +410,97 @@ class GroupCameraFeatureExplorer:
             self.image_search_cache.clear()
             self.status_var.set(f"이미지 루트 설정: {self.image_root}")
 
+    def add_formula_term(self) -> None:
+        if self.df.empty:
+            messagebox.showwarning("CSV 필요", "먼저 CSV를 로드하세요.")
+            return
+
+        feature = self.formula_feature_var.get()
+        if not feature or feature not in self.numeric_features:
+            messagebox.showwarning("Feature 선택", "수치형 feature를 선택하세요.")
+            return
+
+        try:
+            weight = float(self.formula_weight_var.get())
+        except ValueError:
+            messagebox.showwarning("가중치 오류", "가중치는 숫자로 입력하세요. 예: 1, -0.5, 2.3")
+            return
+
+        if not np.isfinite(weight):
+            messagebox.showwarning("가중치 오류", "가중치는 유한한 숫자여야 합니다.")
+            return
+
+        self.custom_terms.append((feature, weight))
+        self.update_formula_display()
+
+    def delete_selected_formula_terms(self) -> None:
+        selected = list(self.term_listbox.curselection())
+        if not selected:
+            return
+        for idx in sorted(selected, reverse=True):
+            if 0 <= idx < len(self.custom_terms):
+                self.custom_terms.pop(idx)
+        self.update_formula_display()
+
+    def clear_formula_terms(self) -> None:
+        self.custom_terms.clear()
+        self.update_formula_display()
+
+    def update_formula_display(self) -> None:
+        if not hasattr(self, "term_listbox"):
+            return
+        self.term_listbox.delete(0, tk.END)
+        if not self.custom_terms:
+            self.formula_text_var.set("항을 추가하세요. 예: bbox_minor * 1 + bbox_major * 0.3 - contrast * 0.8")
+            return
+
+        parts = []
+        for feature, weight in self.custom_terms:
+            sign = "+" if weight >= 0 else "-"
+            abs_weight = abs(weight)
+            text = f"{sign} {abs_weight:g} * {feature}"
+            parts.append(text)
+            self.term_listbox.insert(tk.END, text.lstrip("+ "))
+        self.formula_text_var.set("custom = " + " ".join(parts).lstrip("+ "))
+
+    def apply_custom_metric(self) -> None:
+        if self.df.empty:
+            messagebox.showwarning("CSV 필요", "먼저 CSV를 로드하세요.")
+            return
+        if not self.custom_terms:
+            messagebox.showwarning("항 없음", "지표를 만들 항을 하나 이상 추가하세요.")
+            return
+
+        metric_name = self.formula_name_var.get().strip() or f"custom_metric_{self.custom_metric_counter}"
+        metric_name = re.sub(r"[^0-9A-Za-z가-힣_]+", "_", metric_name).strip("_")
+        if not metric_name:
+            metric_name = f"custom_metric_{self.custom_metric_counter}"
+        if metric_name in ID_LIKE_COLUMNS:
+            metric_name = f"{metric_name}_metric"
+
+        values = pd.Series(0.0, index=self.df.index, dtype=float)
+        missing_features = []
+        for feature, weight in self.custom_terms:
+            if feature not in self.df.columns:
+                missing_features.append(feature)
+                continue
+            feature_values = pd.to_numeric(self.df[feature], errors="coerce")
+            values = values.add(feature_values * weight, fill_value=0.0)
+
+        if missing_features:
+            messagebox.showwarning("누락 feature", f"없는 feature가 있어 제외했습니다: {missing_features}")
+
+        self.df[metric_name] = values.replace([np.inf, -np.inf], np.nan)
+        if metric_name not in self.numeric_features:
+            self.numeric_features.append(metric_name)
+        self.feature_combo["values"] = self.numeric_features
+        self.formula_feature_combo["values"] = self.numeric_features
+        self.feature_var.set(metric_name)
+        self.custom_metric_counter += 1
+        self.formula_name_var.set(f"custom_metric_{self.custom_metric_counter}")
+        self.status_var.set(f"사용자 정의 지표 생성: {metric_name} = {self.formula_text_var.get()}")
+        self.refresh_plot()
+
     def load_csv(self, path: Path) -> None:
         try:
             df = read_csv_flexible(path)
@@ -359,14 +519,21 @@ class GroupCameraFeatureExplorer:
         self.csv_path_var.set(str(path))
         self.df = self._prepare_dataframe(df)
         self.numeric_features = self._numeric_feature_columns(self.df)
+        self.custom_terms.clear()
+        self.custom_metric_counter = 1
 
         if not self.numeric_features:
             messagebox.showerror("수치형 feature 없음", "그래프로 표시할 numeric feature가 없습니다.")
             return
 
         self.feature_combo["values"] = self.numeric_features
+        self.formula_feature_combo["values"] = self.numeric_features
         default_feature = self._default_feature(self.numeric_features)
         self.feature_var.set(default_feature)
+        self.formula_feature_var.set(default_feature)
+        self.formula_name_var.set("custom_metric")
+        self.threshold_var.set("")
+        self.update_formula_display()
 
         groups = ["전체"] + sorted(self.df["group"].astype(str).dropna().unique().tolist())
         cameras = ["전체"] + sorted(self.df["camera_mode"].astype(str).dropna().unique().tolist(), key=self._camera_sort_key)
@@ -457,6 +624,105 @@ class GroupCameraFeatureExplorer:
             part = part[part["camera_mode"].astype(str) == camera_value]
         return part
 
+    def parse_threshold(self) -> float | None:
+        raw = self.threshold_var.get().strip()
+        if not raw:
+            return None
+        try:
+            threshold = float(raw)
+        except ValueError:
+            return None
+        if not np.isfinite(threshold):
+            return None
+        return threshold
+
+    def threshold_filter_mask(self, values: pd.Series, threshold: float) -> pd.Series:
+        numeric = pd.to_numeric(values, errors="coerce")
+        if self.threshold_direction_var.get().startswith("하단"):
+            return numeric <= threshold
+        return numeric >= threshold
+
+    def clear_threshold_table(self) -> None:
+        if not hasattr(self, "threshold_tree"):
+            return
+        for item in self.threshold_tree.get_children():
+            self.threshold_tree.delete(item)
+
+    def update_threshold_table(self, plot_df: pd.DataFrame, feature: str, threshold: float | None) -> None:
+        self.clear_threshold_table()
+        if threshold is None or plot_df.empty:
+            return
+
+        work = plot_df.copy()
+        work[feature] = pd.to_numeric(work[feature], errors="coerce")
+        work = work.dropna(subset=[feature])
+        if work.empty:
+            return
+
+        work["side"] = np.where(work[feature] >= threshold, "상단(>=)", "하단(<)")
+        total = len(work)
+        type_total = work.groupby("defect_type").size().to_dict()
+
+        rows = []
+        for side, part in work.groupby("side", sort=False):
+            rows.append(
+                {
+                    "scope": "전체",
+                    "side": side,
+                    "camera_mode": "전체",
+                    "defect_type": "전체",
+                    "count": len(part),
+                    "rate_total": len(part) / max(total, 1),
+                    "rate_within_type": len(part) / max(total, 1),
+                    "mean": part[feature].mean(),
+                }
+            )
+
+        for (side, defect_type), part in work.groupby(["side", "defect_type"], sort=False):
+            rows.append(
+                {
+                    "scope": "라벨별",
+                    "side": side,
+                    "camera_mode": "전체",
+                    "defect_type": defect_type,
+                    "count": len(part),
+                    "rate_total": len(part) / max(total, 1),
+                    "rate_within_type": len(part) / max(type_total.get(defect_type, 0), 1),
+                    "mean": part[feature].mean(),
+                }
+            )
+
+        camera_type_total = work.groupby(["camera_mode", "defect_type"]).size().to_dict()
+        for (side, camera_mode, defect_type), part in work.groupby(["side", "camera_mode", "defect_type"], sort=False):
+            denom = camera_type_total.get((camera_mode, defect_type), 0)
+            rows.append(
+                {
+                    "scope": "카메라x라벨",
+                    "side": side,
+                    "camera_mode": camera_mode,
+                    "defect_type": defect_type,
+                    "count": len(part),
+                    "rate_total": len(part) / max(total, 1),
+                    "rate_within_type": len(part) / max(denom, 1),
+                    "mean": part[feature].mean(),
+                }
+            )
+
+        sort_key = {"전체": 0, "라벨별": 1, "카메라x라벨": 2}
+        rows = sorted(rows, key=lambda row: (sort_key.get(row["scope"], 99), row["side"], str(row["camera_mode"]), str(row["defect_type"])))
+        for row in rows:
+            values = [
+                row["scope"],
+                row["side"],
+                row["camera_mode"],
+                row["defect_type"],
+                int(row["count"]),
+                self.format_percent(row["rate_total"]),
+                self.format_percent(row["rate_within_type"]),
+                self.format_number(row["mean"]),
+            ]
+            self.threshold_tree.insert("", tk.END, values=values)
+
     def refresh_plot(self) -> None:
         if self.df.empty:
             return
@@ -468,10 +734,12 @@ class GroupCameraFeatureExplorer:
         plot_df = self.filtered_df[["row_id", "group", "camera_mode", "defect_type", "image_path", feature]].copy()
         plot_df[feature] = pd.to_numeric(plot_df[feature], errors="coerce")
         plot_df = plot_df.dropna(subset=[feature])
+        threshold = self.parse_threshold()
 
         self.ax.clear()
         self.artist_rows.clear()
         self.update_summary_table(plot_df, feature)
+        self.update_threshold_table(plot_df, feature, threshold)
 
         if plot_df.empty:
             self.ax.set_title("표시할 데이터가 없습니다.")
@@ -512,6 +780,32 @@ class GroupCameraFeatureExplorer:
             self.ax.scatter(x, row["mean"], marker="D", s=58, color="black", zorder=5)
             self.ax.hlines(row["mean"], x - 0.32, x + 0.32, colors="black", linewidth=2.0, zorder=4)
 
+        threshold_status = ""
+        if threshold is not None:
+            threshold_mask = self.threshold_filter_mask(plot_df[feature], threshold)
+            filtered_by_threshold = plot_df[threshold_mask]
+            upper_count = int((plot_df[feature] >= threshold).sum())
+            lower_count = int((plot_df[feature] < threshold).sum())
+            direction_text = self.threshold_direction_var.get()
+            threshold_status = (
+                f" | threshold={threshold:g}, 상단={upper_count}, 하단={lower_count}, "
+                f"{direction_text} 필터={len(filtered_by_threshold)}"
+            )
+            self.ax.axhline(threshold, color="#d62728", linestyle="--", linewidth=1.4, label=f"threshold={threshold:g}")
+            if not filtered_by_threshold.empty:
+                self.ax.scatter(
+                    filtered_by_threshold["x"],
+                    filtered_by_threshold[feature],
+                    s=92,
+                    facecolors="none",
+                    edgecolors="black",
+                    linewidths=1.3,
+                    label=f"threshold filter ({len(filtered_by_threshold)})",
+                    zorder=6,
+                )
+        elif self.threshold_var.get().strip():
+            threshold_status = " | threshold 입력값이 숫자가 아닙니다."
+
         labels = [f"{group}\ncam={camera}" for group, camera in categories]
         self.ax.set_xticks(range(len(categories)))
         self.ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
@@ -523,7 +817,7 @@ class GroupCameraFeatureExplorer:
         self.figure.tight_layout()
         self.canvas.draw_idle()
         self.status_var.set(
-            f"표시 rows={len(plot_df)} | groups={plot_df['group'].nunique()} | cameras={plot_df['camera_mode'].nunique()} | 점 클릭 시 이미지 창 갱신"
+            f"표시 rows={len(plot_df)} | groups={plot_df['group'].nunique()} | cameras={plot_df['camera_mode'].nunique()} | 점 클릭 시 이미지 창 갱신{threshold_status}"
         )
 
     def summary_frame(self, plot_df: pd.DataFrame, feature: str) -> pd.DataFrame:
@@ -602,6 +896,13 @@ class GroupCameraFeatureExplorer:
         if abs(number) >= 1:
             return f"{number:.4f}"
         return f"{number:.6f}"
+
+    @staticmethod
+    def format_percent(value: object) -> str:
+        number = safe_float(value)
+        if math.isnan(number):
+            return ""
+        return f"{number * 100:.2f}%"
 
     def on_pick(self, event) -> None:  # noqa: ANN001 - matplotlib event
         artist = event.artist

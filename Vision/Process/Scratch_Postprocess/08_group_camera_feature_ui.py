@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - optional acceleration
     cv2 = None
 
 try:
-    from PIL import Image, ImageFilter, ImageTk
+    from PIL import Image, ImageDraw, ImageFilter, ImageTk
 except ImportError as exc:  # pragma: no cover - runtime dependency message
     raise ImportError("Pillow가 필요합니다. `python -m pip install pillow` 후 다시 실행하세요.") from exc
 
@@ -505,6 +505,7 @@ class ImageViewer:
         k = int(self.cluster_k_var.get())
         base, correction_text = self.make_analysis_base()
         adjusted = self.apply_blur(self.apply_contrast(base, contrast), blur_radius)
+        angle_enabled = bool(self.refine_angle_var.get())
         cluster_mask = self.mask_array if self.cluster_mask_only_var.get() else None
         clustered, refined, stats_text = self.kmeans_cluster_image(
             adjusted,
@@ -514,7 +515,8 @@ class ImageViewer:
             refine_kernel=int(self.refine_kernel_var.get()),
             refine_kernel_w=int(self.refine_kernel_w_var.get()),
             refine_kernel_h=int(self.refine_kernel_h_var.get()),
-            refine_angle_enabled=bool(self.refine_angle_var.get()),
+            refine_angle_enabled=angle_enabled,
+            angle_mask=self.mask_array,
             refine_open_iter=int(self.refine_open_iter_var.get()),
             refine_close_iter=int(self.refine_close_iter_var.get()),
             refine_min_area=int(self.refine_min_area_var.get()),
@@ -525,6 +527,8 @@ class ImageViewer:
         else:
             clustered_display = clustered
             refined_display = refined
+        if angle_enabled and self.mask_array is not None:
+            refined_display = self.draw_angle_overlay(refined_display, self.mask_array)
 
         self.adjusted_photo = ImageTk.PhotoImage(self.to_display_image(adjusted))
         self.cluster_photo = ImageTk.PhotoImage(self.to_display_image(clustered_display))
@@ -579,6 +583,57 @@ class ImageViewer:
         alpha = float(np.clip(alpha, 0.0, 1.0))
         out[overlay_mask] = (1.0 - alpha) * base_f[overlay_mask] + alpha * overlay_f[overlay_mask]
         return np.clip(out, 0, 255).astype(np.uint8)
+
+    @classmethod
+    def draw_angle_overlay(cls, array: np.ndarray, mask: np.ndarray, max_components: int = 80) -> np.ndarray:
+        if mask is None or mask.shape != array.shape[:2] or not mask.any():
+            return array
+
+        image = Image.fromarray(array.astype(np.uint8).copy(), mode="RGB")
+        draw = ImageDraw.Draw(image)
+        h, w = mask.shape
+        line_width = max(2, int(round(min(h, w) / 320)))
+        components = cls.connected_components_bool(mask, min_area=8)
+        components.sort(key=len, reverse=True)
+
+        for index, coords in enumerate(components[:max_components]):
+            geometry = cls.component_angle_geometry(coords)
+            corners = np.asarray(geometry["corners_xy"], dtype=np.float32)
+            angle = float(geometry["angle_deg"])
+            center_x, center_y = (float(v) for v in geometry["center_xy"])
+            major_len = max(float(geometry["major_length"]), 12.0)
+            minor_len = max(float(geometry["minor_length"]), 12.0)
+            angle_rad = math.radians(angle)
+            ux, uy = math.cos(angle_rad), math.sin(angle_rad)
+            vx, vy = -uy, ux
+
+            polygon = [(float(x), float(y)) for x, y in corners]
+            draw.line(polygon + [polygon[0]], fill=(255, 0, 0), width=line_width)
+
+            w_axis = min(max(major_len * 0.5, 18.0), 90.0)
+            h_axis = min(max(minor_len * 0.5, 14.0), 70.0)
+            w0 = (center_x - ux * w_axis, center_y - uy * w_axis)
+            w1 = (center_x + ux * w_axis, center_y + uy * w_axis)
+            h0 = (center_x - vx * h_axis, center_y - vy * h_axis)
+            h1 = (center_x + vx * h_axis, center_y + vy * h_axis)
+
+            draw.line([w0, w1], fill=(255, 255, 0), width=line_width + 1)
+            draw.line([h0, h1], fill=(0, 255, 255), width=line_width + 1)
+            draw.ellipse(
+                [center_x - line_width, center_y - line_width, center_x + line_width, center_y + line_width],
+                fill=(255, 0, 0),
+            )
+
+            if index < 20:
+                label_x = max(0.0, min(w - 80.0, min(x for x, _y in polygon)))
+                label_y = max(0.0, min(h - 12.0, min(y for _x, y in polygon) - 12.0))
+                text = f"{angle:.1f} deg"
+                draw.text((label_x + 1, label_y + 1), text, fill=(0, 0, 0))
+                draw.text((label_x, label_y), text, fill=(255, 0, 0))
+                draw.text((w1[0] + 2, w1[1] + 2), "W", fill=(255, 255, 0))
+                draw.text((h1[0] + 2, h1[1] + 2), "H", fill=(0, 255, 255))
+
+        return np.asarray(image, dtype=np.uint8)
 
     @staticmethod
     def load_rgb_array(path: Path | None, expected_shape: tuple[int, int] | None = None) -> np.ndarray | None:
@@ -648,24 +703,86 @@ class ImageViewer:
         return perp_y / norm, perp_x / norm
 
     @staticmethod
-    def component_major_angle_deg(coords_yx: np.ndarray) -> float:
+    def normalize_axis_angle_deg(angle: float) -> float:
+        angle = float(angle)
+        while angle <= -90.0:
+            angle += 180.0
+        while angle > 90.0:
+            angle -= 180.0
+        return angle
+
+    @classmethod
+    def component_angle_geometry(cls, coords_yx: np.ndarray) -> dict[str, object]:
         coords_xy = coords_yx[:, [1, 0]].astype(np.float32)
+        if len(coords_xy) == 0:
+            return {
+                "angle_deg": 0.0,
+                "center_xy": (0.0, 0.0),
+                "corners_xy": np.zeros((4, 2), dtype=np.float32),
+                "major_length": 0.0,
+                "minor_length": 0.0,
+            }
+
         if len(coords_xy) < 2:
-            return 0.0
+            x, y = coords_xy[0]
+            corners = np.array([[x, y], [x + 1.0, y], [x + 1.0, y + 1.0], [x, y + 1.0]], dtype=np.float32)
+            return {
+                "angle_deg": 0.0,
+                "center_xy": (float(x), float(y)),
+                "corners_xy": corners,
+                "major_length": 1.0,
+                "minor_length": 1.0,
+            }
 
         if cv2 is not None and len(coords_xy) >= 5:
             rect = cv2.minAreaRect(coords_xy)
             width, height = rect[1]
             angle = float(rect[2])
+            major_length = float(width)
+            minor_length = float(height)
             if width < height:
                 angle += 90.0
-            return angle
+                major_length, minor_length = float(height), float(width)
+            return {
+                "angle_deg": cls.normalize_axis_angle_deg(angle),
+                "center_xy": (float(rect[0][0]), float(rect[0][1])),
+                "corners_xy": cv2.boxPoints(rect).astype(np.float32),
+                "major_length": major_length,
+                "minor_length": minor_length,
+            }
 
         centered = coords_xy - coords_xy.mean(axis=0, keepdims=True)
         cov = np.cov(centered.T)
         eigvals, eigvecs = np.linalg.eigh(cov)
         major_vec = eigvecs[:, int(np.argmax(eigvals))]
-        return math.degrees(math.atan2(float(major_vec[1]), float(major_vec[0])))
+        angle = cls.normalize_axis_angle_deg(math.degrees(math.atan2(float(major_vec[1]), float(major_vec[0]))))
+        angle_rad = math.radians(angle)
+        major_axis = np.array([math.cos(angle_rad), math.sin(angle_rad)], dtype=np.float32)
+        minor_axis = np.array([-math.sin(angle_rad), math.cos(angle_rad)], dtype=np.float32)
+        major_projection = coords_xy @ major_axis
+        minor_projection = coords_xy @ minor_axis
+        major_min, major_max = float(major_projection.min()), float(major_projection.max())
+        minor_min, minor_max = float(minor_projection.min()), float(minor_projection.max())
+        corners = np.array(
+            [
+                major_axis * major_min + minor_axis * minor_min,
+                major_axis * major_max + minor_axis * minor_min,
+                major_axis * major_max + minor_axis * minor_max,
+                major_axis * major_min + minor_axis * minor_max,
+            ],
+            dtype=np.float32,
+        )
+        return {
+            "angle_deg": angle,
+            "center_xy": (float(coords_xy[:, 0].mean()), float(coords_xy[:, 1].mean())),
+            "corners_xy": corners,
+            "major_length": max(major_max - major_min, 1.0),
+            "minor_length": max(minor_max - minor_min, 1.0),
+        }
+
+    @classmethod
+    def component_major_angle_deg(cls, coords_yx: np.ndarray) -> float:
+        return float(cls.component_angle_geometry(coords_yx)["angle_deg"])
 
     @staticmethod
     def sample_perpendicular_background(
@@ -906,7 +1023,7 @@ class ImageViewer:
             center = ((patch_w - 1) / 2.0, (patch_h - 1) / 2.0)
 
             if cv2 is not None:
-                rotate_to_axis = cv2.getRotationMatrix2D(center, -angle, 1.0)
+                rotate_to_axis = cv2.getRotationMatrix2D(center, angle, 1.0)
                 rotated = cv2.warpAffine(
                     patch_input.astype(np.uint8),
                     rotate_to_axis,
@@ -920,7 +1037,7 @@ class ImageViewer:
                 if close_iter:
                     rotated = cv2.morphologyEx(rotated, cv2.MORPH_CLOSE, kernel, iterations=close_iter)
 
-                rotate_back = cv2.getRotationMatrix2D(center, angle, 1.0)
+                rotate_back = cv2.getRotationMatrix2D(center, -angle, 1.0)
                 restored = cv2.warpAffine(
                     rotated,
                     rotate_back,
@@ -930,7 +1047,7 @@ class ImageViewer:
                     borderValue=0,
                 ).astype(bool)
             else:
-                rotated = cls.rotate_binary_patch(patch_input, -angle)
+                rotated = cls.rotate_binary_patch(patch_input, angle)
                 cleaned = cls.morphology_clean(
                     rotated,
                     kernel_size=kernel_size,
@@ -939,7 +1056,7 @@ class ImageViewer:
                     open_iter=open_iter,
                     close_iter=close_iter,
                 )
-                restored = cls.rotate_binary_patch(cleaned, angle)
+                restored = cls.rotate_binary_patch(cleaned, -angle)
             out[y0:y1, x0:x1] |= restored & component_patch
             angle_component_count += 1
 
@@ -1018,6 +1135,7 @@ class ImageViewer:
         refine_kernel_w: int | None = None,
         refine_kernel_h: int | None = None,
         refine_angle_enabled: bool = False,
+        angle_mask: np.ndarray | None = None,
         refine_open_iter: int = 1,
         refine_close_iter: int = 1,
         refine_min_area: int = 12,
@@ -1027,6 +1145,10 @@ class ImageViewer:
         rows = []
         refined_labels = np.full(labels_2d.shape, -1, dtype=np.int16)
         angle_component_total = 0
+        if angle_mask is not None and angle_mask.shape == valid_mask.shape and angle_mask.any():
+            angle_ref_mask = angle_mask.astype(bool)
+        else:
+            angle_ref_mask = valid_mask
         for cluster_id in range(k):
             raw_cluster = (labels_2d == cluster_id) & valid_mask
             raw_area = int(raw_cluster.sum())
@@ -1047,7 +1169,7 @@ class ImageViewer:
             if refine_angle_enabled:
                 clean, angle_component_count = cls.morphology_clean_angle_aligned(
                     raw_cluster,
-                    angle_mask=valid_mask,
+                    angle_mask=angle_ref_mask,
                     kernel_size=refine_kernel,
                     kernel_w=refine_kernel_w,
                     kernel_h=refine_kernel_h,
@@ -1106,6 +1228,7 @@ class ImageViewer:
         refine_kernel_w: int | None = None,
         refine_kernel_h: int | None = None,
         refine_angle_enabled: bool = False,
+        angle_mask: np.ndarray | None = None,
         refine_open_iter: int = 1,
         refine_close_iter: int = 1,
         refine_min_area: int = 12,
@@ -1194,6 +1317,7 @@ class ImageViewer:
             refine_kernel_w=refine_kernel_w,
             refine_kernel_h=refine_kernel_h,
             refine_angle_enabled=refine_angle_enabled,
+            angle_mask=angle_mask,
             refine_open_iter=refine_open_iter,
             refine_close_iter=refine_close_iter,
             refine_min_area=refine_min_area,

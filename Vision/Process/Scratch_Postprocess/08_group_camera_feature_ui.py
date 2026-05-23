@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageFilter, ImageTk
 except ImportError as exc:  # pragma: no cover - runtime dependency message
     raise ImportError("Pillow가 필요합니다. `python -m pip install pillow` 후 다시 실행하세요.") from exc
 
@@ -145,6 +145,8 @@ class ImageViewer:
         self.adjusted_photo: ImageTk.PhotoImage | None = None
         self.cluster_photo: ImageTk.PhotoImage | None = None
         self.original_array: np.ndarray | None = None
+        self.raw_array: np.ndarray | None = None
+        self.mask_array: np.ndarray | None = None
         self.current_path: Path | None = None
         self.current_meta = ""
         self.source_paths: dict[str, Path] = {}
@@ -152,7 +154,12 @@ class ImageViewer:
         self.source_combo: ttk.Combobox | None = None
         self.render_after_id: str | None = None
         self.contrast_var = tk.DoubleVar(value=1.0)
+        self.blur_var = tk.DoubleVar(value=0.0)
         self.cluster_k_var = tk.IntVar(value=4)
+        self.directional_cancel_var = tk.BooleanVar(value=False)
+        self.directional_strength_var = tk.DoubleVar(value=0.8)
+        self.directional_radius_var = tk.IntVar(value=8)
+        self.cluster_mask_only_var = tk.BooleanVar(value=True)
 
     def _ensure_window(self) -> None:
         if self.window is not None and self.window.winfo_exists():
@@ -160,7 +167,7 @@ class ImageViewer:
 
         self.window = tk.Toplevel(self.master)
         self.window.title("선택 패치 분석")
-        self.window.geometry("1180x860")
+        self.window.geometry("1580x900")
         self.window.protocol("WM_DELETE_WINDOW", self.window.withdraw)
 
         self.meta_label = ttk.Label(self.window, text="", anchor="w", justify="left")
@@ -193,6 +200,19 @@ class ImageViewer:
         )
         contrast_scale.pack(side=tk.LEFT, padx=(0, 18))
 
+        ttk.Label(control_frame, text="Gaussian blur").pack(side=tk.LEFT, padx=(0, 6))
+        blur_scale = tk.Scale(
+            control_frame,
+            from_=0.0,
+            to=5.0,
+            resolution=0.1,
+            orient=tk.HORIZONTAL,
+            variable=self.blur_var,
+            length=220,
+            command=lambda _value: self.schedule_render(),
+        )
+        blur_scale.pack(side=tk.LEFT, padx=(0, 18))
+
         ttk.Label(control_frame, text="K 그룹").pack(side=tk.LEFT, padx=(0, 6))
         k_scale = tk.Scale(
             control_frame,
@@ -205,8 +225,44 @@ class ImageViewer:
             command=lambda _value: self.schedule_render(),
         )
         k_scale.pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Checkbutton(
+            control_frame,
+            text="수직 상쇄",
+            variable=self.directional_cancel_var,
+            command=self.schedule_render,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(control_frame, text="강도").pack(side=tk.LEFT, padx=(0, 4))
+        cancel_strength_scale = tk.Scale(
+            control_frame,
+            from_=0.0,
+            to=1.0,
+            resolution=0.05,
+            orient=tk.HORIZONTAL,
+            variable=self.directional_strength_var,
+            length=130,
+            command=lambda _value: self.schedule_render(),
+        )
+        cancel_strength_scale.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(control_frame, text="탐색").pack(side=tk.LEFT, padx=(0, 4))
+        cancel_radius_scale = tk.Scale(
+            control_frame,
+            from_=2,
+            to=24,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            variable=self.directional_radius_var,
+            length=130,
+            command=lambda _value: self.schedule_render(),
+        )
+        cancel_radius_scale.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Checkbutton(
+            control_frame,
+            text="Mask 영역 K-Means",
+            variable=self.cluster_mask_only_var,
+            command=self.schedule_render,
+        ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(control_frame, text="Reset", command=self.reset_controls).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(control_frame, text="K-Means는 contrast 조정 후 RGB 픽셀값을 기준으로 계산").pack(side=tk.LEFT)
+        ttk.Label(control_frame, text="K-Means는 보정/contrast/blur 적용 후 RGB 픽셀값 기준").pack(side=tk.LEFT)
 
         view_frame = ttk.Frame(self.window)
         view_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -278,6 +334,12 @@ class ImageViewer:
             with Image.open(image_path) as img:
                 img = img.convert("RGB")
                 self.original_array = np.asarray(img, dtype=np.uint8).copy()
+            self.raw_array = self.load_rgb_array(self.source_paths.get("image_path"), self.original_array.shape[:2])
+            if self.raw_array is None and source_name == "image_path":
+                self.raw_array = self.original_array
+            self.mask_array = self.load_mask_array(self.source_paths.get("mask_path"), self.original_array.shape[:2])
+            if self.mask_array is None and source_name in {"mask_raw_path", "mask_path"}:
+                self.mask_array = self.infer_nonzero_mask(self.original_array)
         except Exception as exc:  # noqa: BLE001
             self.show_error(f"{self.current_meta}\n\n이미지 로딩 실패: [{source_name}] {image_path}\n{exc}")
             return
@@ -288,7 +350,12 @@ class ImageViewer:
 
     def reset_controls(self) -> None:
         self.contrast_var.set(1.0)
+        self.blur_var.set(0.0)
         self.cluster_k_var.set(4)
+        self.directional_cancel_var.set(False)
+        self.directional_strength_var.set(0.8)
+        self.directional_radius_var.set(8)
+        self.cluster_mask_only_var.set(True)
         self.render_images()
 
     def schedule_render(self) -> None:
@@ -305,16 +372,41 @@ class ImageViewer:
         assert self.adjusted_image_label is not None and self.cluster_image_label is not None
 
         contrast = float(self.contrast_var.get())
+        blur_radius = float(self.blur_var.get())
         k = int(self.cluster_k_var.get())
-        adjusted = self.apply_contrast(self.original_array, contrast)
-        clustered, stats_text = self.kmeans_cluster_image(adjusted, k)
+        base, correction_text = self.make_analysis_base()
+        adjusted = self.apply_blur(self.apply_contrast(base, contrast), blur_radius)
+        cluster_mask = self.mask_array if self.cluster_mask_only_var.get() else None
+        clustered, stats_text = self.kmeans_cluster_image(adjusted, k, mask=cluster_mask)
 
         self.adjusted_photo = ImageTk.PhotoImage(self.to_display_image(adjusted))
         self.cluster_photo = ImageTk.PhotoImage(self.to_display_image(clustered))
         self.adjusted_image_label.config(image=self.adjusted_photo, text="")
         self.cluster_image_label.config(image=self.cluster_photo, text="")
         if self.cluster_stats_label is not None:
-            self.cluster_stats_label.config(text=f"contrast={contrast:.2f}, K={k} | {stats_text}")
+            self.cluster_stats_label.config(
+                text=f"contrast={contrast:.2f}, blur={blur_radius:.1f}, K={k}, mask_only={self.cluster_mask_only_var.get()} | {correction_text} | {stats_text}"
+            )
+
+    def make_analysis_base(self) -> tuple[np.ndarray, str]:
+        assert self.original_array is not None
+        source_name = self.source_var.get()
+        if not self.directional_cancel_var.get():
+            return self.original_array, "directional_cancel=off"
+        if self.raw_array is None or self.mask_array is None:
+            return self.original_array, "directional_cancel=unavailable(raw/mask missing)"
+
+        strength = float(self.directional_strength_var.get())
+        radius = int(self.directional_radius_var.get())
+        mask_only_output = source_name in {"mask_raw_path", "mask_path"}
+        corrected, stats = self.directional_perpendicular_cancel(
+            raw_array=self.raw_array,
+            mask=self.mask_array,
+            strength=strength,
+            search_radius=radius,
+            mask_only_output=mask_only_output,
+        )
+        return corrected, f"directional_cancel=on, strength={strength:.2f}, radius={radius}, {stats}"
 
     @staticmethod
     def apply_contrast(array: np.ndarray, contrast: float) -> np.ndarray:
@@ -323,18 +415,153 @@ class ImageViewer:
         return np.clip(adjusted, 0, 255).astype(np.uint8)
 
     @staticmethod
+    def apply_blur(array: np.ndarray, radius: float) -> np.ndarray:
+        if radius <= 0:
+            return array
+        image = Image.fromarray(array.astype(np.uint8), mode="RGB")
+        return np.asarray(image.filter(ImageFilter.GaussianBlur(radius=float(radius))), dtype=np.uint8)
+
+    @staticmethod
+    def load_rgb_array(path: Path | None, expected_shape: tuple[int, int] | None = None) -> np.ndarray | None:
+        if path is None or not path.exists():
+            return None
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            if expected_shape is not None and img.size != (expected_shape[1], expected_shape[0]):
+                img = img.resize((expected_shape[1], expected_shape[0]), Image.Resampling.BILINEAR)
+            return np.asarray(img.convert("RGB"), dtype=np.uint8).copy()
+
+    @staticmethod
+    def load_mask_array(path: Path | None, expected_shape: tuple[int, int]) -> np.ndarray | None:
+        if path is None or not path.exists():
+            return None
+        with Image.open(path) as img:
+            mask_img = img.convert("L")
+            if mask_img.size != (expected_shape[1], expected_shape[0]):
+                mask_img = mask_img.resize((expected_shape[1], expected_shape[0]), Image.Resampling.NEAREST)
+            return np.asarray(mask_img, dtype=np.uint8) > 0
+
+    @staticmethod
+    def infer_nonzero_mask(array: np.ndarray) -> np.ndarray:
+        return np.any(array.astype(np.uint8) > 0, axis=2)
+
+    @staticmethod
+    def connected_components_bool(mask: np.ndarray, min_area: int = 8) -> list[np.ndarray]:
+        mask_bool = mask.astype(bool)
+        h, w = mask_bool.shape
+        visited = np.zeros_like(mask_bool, dtype=bool)
+        components: list[np.ndarray] = []
+        for y0, x0 in zip(*np.where(mask_bool & ~visited)):
+            if visited[y0, x0]:
+                continue
+            stack = [(int(y0), int(x0))]
+            visited[y0, x0] = True
+            coords: list[tuple[int, int]] = []
+            while stack:
+                y, x = stack.pop()
+                coords.append((y, x))
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dy == 0 and dx == 0:
+                            continue
+                        ny, nx = y + dy, x + dx
+                        if 0 <= ny < h and 0 <= nx < w and mask_bool[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+            if len(coords) >= min_area:
+                components.append(np.asarray(coords, dtype=np.int32))
+        return components
+
+    @staticmethod
+    def component_perpendicular(coords_yx: np.ndarray) -> tuple[float, float]:
+        coords_xy = coords_yx[:, [1, 0]].astype(np.float32)
+        if len(coords_xy) < 2:
+            return 0.0, 1.0
+        centered = coords_xy - coords_xy.mean(axis=0, keepdims=True)
+        cov = np.cov(centered.T)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        major_vec = eigvecs[:, int(np.argmax(eigvals))]
+        perp_x = -float(major_vec[1])
+        perp_y = float(major_vec[0])
+        norm = math.sqrt(perp_x * perp_x + perp_y * perp_y)
+        if norm < 1e-6:
+            return 0.0, 1.0
+        return perp_y / norm, perp_x / norm
+
+    @staticmethod
+    def sample_perpendicular_background(
+        raw_array: np.ndarray,
+        mask: np.ndarray,
+        y: int,
+        x: int,
+        perp_y: float,
+        perp_x: float,
+        search_radius: int,
+    ) -> np.ndarray | None:
+        h, w = mask.shape
+        samples = []
+        for sign in (-1, 1):
+            for distance in range(1, search_radius + 1):
+                ny = int(round(y + sign * perp_y * distance))
+                nx = int(round(x + sign * perp_x * distance))
+                if not (0 <= ny < h and 0 <= nx < w):
+                    continue
+                if not mask[ny, nx]:
+                    samples.append(raw_array[ny, nx].astype(np.float32))
+                    break
+        if not samples:
+            return None
+        return np.mean(np.vstack(samples), axis=0)
+
+    @classmethod
+    def directional_perpendicular_cancel(
+        cls,
+        raw_array: np.ndarray,
+        mask: np.ndarray,
+        strength: float,
+        search_radius: int,
+        mask_only_output: bool,
+    ) -> tuple[np.ndarray, str]:
+        if raw_array.shape[:2] != mask.shape:
+            raise ValueError("raw_array and mask shape mismatch")
+        strength = float(np.clip(strength, 0.0, 1.0))
+        search_radius = int(np.clip(search_radius, 1, 64))
+
+        output = np.zeros_like(raw_array) if mask_only_output else raw_array.copy()
+        components = cls.connected_components_bool(mask, min_area=8)
+        corrected_pixels = 0
+        for coords in components:
+            perp_y, perp_x = cls.component_perpendicular(coords)
+            for y, x in coords:
+                replacement = cls.sample_perpendicular_background(raw_array, mask, int(y), int(x), perp_y, perp_x, search_radius)
+                if replacement is None:
+                    output[y, x] = raw_array[y, x]
+                    continue
+                current = raw_array[y, x].astype(np.float32)
+                output[y, x] = np.clip((1.0 - strength) * current + strength * replacement, 0, 255).astype(np.uint8)
+                corrected_pixels += 1
+        return output, f"components={len(components)}, corrected_px={corrected_pixels}"
+
+    @staticmethod
     def to_display_image(array: np.ndarray) -> Image.Image:
         image = Image.fromarray(array.astype(np.uint8), mode="RGB")
         image.thumbnail((550, 650), Image.Resampling.LANCZOS)
         return image
 
     @staticmethod
-    def kmeans_cluster_image(array: np.ndarray, k: int) -> tuple[np.ndarray, str]:
+    def kmeans_cluster_image(array: np.ndarray, k: int, mask: np.ndarray | None = None) -> tuple[np.ndarray, str]:
         k = int(np.clip(k, 2, 8))
         h, w, _ = array.shape
-        pixels = array.reshape(-1, 3).astype(np.float32)
+        if mask is not None and mask.shape == (h, w) and mask.any():
+            valid_mask = mask.astype(bool)
+        else:
+            valid_mask = np.ones((h, w), dtype=bool)
+
+        pixels = array[valid_mask].reshape(-1, 3).astype(np.float32)
         rng = np.random.default_rng(17)
         sample_size = min(25000, len(pixels))
+        if sample_size <= 0:
+            return np.zeros_like(array), "no valid pixels"
         sample_idx = rng.choice(len(pixels), size=sample_size, replace=False)
         sample = pixels[sample_idx]
 
@@ -389,7 +616,8 @@ class ImageViewer:
             ],
             dtype=np.uint8,
         )
-        clustered = palette[ordered_labels].reshape(h, w, 3)
+        clustered = np.zeros((h, w, 3), dtype=np.uint8)
+        clustered[valid_mask] = palette[ordered_labels]
         counts = np.bincount(ordered_labels, minlength=k)
         total = max(int(counts.sum()), 1)
         stats = []

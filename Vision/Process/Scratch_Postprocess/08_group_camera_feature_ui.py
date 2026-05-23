@@ -14,6 +14,7 @@ import argparse
 import math
 import re
 import sys
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
@@ -21,6 +22,11 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 import pandas as pd
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover - optional acceleration
+    cv2 = None
 
 try:
     from PIL import Image, ImageFilter, ImageTk
@@ -278,7 +284,7 @@ class ImageViewer:
         self.cluster_image_label = ttk.Label(view_frame, anchor="center")
         self.cluster_image_label.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
 
-        self.cluster_stats_label = ttk.Label(self.window, text="", anchor="w", justify="left")
+        self.cluster_stats_label = ttk.Label(self.window, text="", anchor="w", justify="left", wraplength=1500)
         self.cluster_stats_label.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 8))
 
     def show_error(self, message: str) -> None:
@@ -549,7 +555,153 @@ class ImageViewer:
         return image
 
     @staticmethod
+    def binary_dilate(mask: np.ndarray) -> np.ndarray:
+        padded = np.pad(mask.astype(bool), 1, mode="constant", constant_values=False)
+        out = np.zeros_like(mask, dtype=bool)
+        for dy in range(3):
+            for dx in range(3):
+                out |= padded[dy : dy + mask.shape[0], dx : dx + mask.shape[1]]
+        return out
+
+    @staticmethod
+    def binary_erode(mask: np.ndarray) -> np.ndarray:
+        padded = np.pad(mask.astype(bool), 1, mode="constant", constant_values=False)
+        out = np.ones_like(mask, dtype=bool)
+        for dy in range(3):
+            for dx in range(3):
+                out &= padded[dy : dy + mask.shape[0], dx : dx + mask.shape[1]]
+        return out
+
+    @classmethod
+    def morphology_clean(cls, mask: np.ndarray) -> np.ndarray:
+        mask_bool = mask.astype(bool)
+        if cv2 is not None:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            as_u8 = mask_bool.astype(np.uint8)
+            opened = cv2.morphologyEx(as_u8, cv2.MORPH_OPEN, kernel)
+            closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
+            return closed.astype(bool)
+        opened = cls.binary_dilate(cls.binary_erode(mask_bool))
+        closed = cls.binary_erode(cls.binary_dilate(opened))
+        return closed
+
+    @classmethod
+    def connected_component_summary(cls, mask: np.ndarray) -> dict[str, float]:
+        clean = mask.astype(bool)
+        clean_area = int(clean.sum())
+        if clean_area <= 0:
+            return {
+                "component_count": 0.0,
+                "largest_component_area": 0.0,
+                "largest_component_ratio": 0.0,
+                "small_component_ratio": 0.0,
+                "largest_bbox_fill_ratio": 0.0,
+            }
+
+        if cv2 is not None:
+            num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(clean.astype(np.uint8), connectivity=8)
+            if num_labels <= 1:
+                return {
+                    "component_count": 0.0,
+                    "largest_component_area": 0.0,
+                    "largest_component_ratio": 0.0,
+                    "small_component_ratio": 0.0,
+                    "largest_bbox_fill_ratio": 0.0,
+                }
+            areas = stats[1:, cv2.CC_STAT_AREA].astype(np.float32)
+            widths = stats[1:, cv2.CC_STAT_WIDTH].astype(np.float32)
+            heights = stats[1:, cv2.CC_STAT_HEIGHT].astype(np.float32)
+        else:
+            components = cls.connected_components_bool(clean, min_area=1)
+            if not components:
+                return {
+                    "component_count": 0.0,
+                    "largest_component_area": 0.0,
+                    "largest_component_ratio": 0.0,
+                    "small_component_ratio": 0.0,
+                    "largest_bbox_fill_ratio": 0.0,
+                }
+            areas_list = []
+            widths_list = []
+            heights_list = []
+            for coords in components:
+                yy = coords[:, 0]
+                xx = coords[:, 1]
+                areas_list.append(float(len(coords)))
+                widths_list.append(float(xx.max() - xx.min() + 1))
+                heights_list.append(float(yy.max() - yy.min() + 1))
+            areas = np.asarray(areas_list, dtype=np.float32)
+            widths = np.asarray(widths_list, dtype=np.float32)
+            heights = np.asarray(heights_list, dtype=np.float32)
+
+        largest_idx = int(np.argmax(areas))
+        largest_area = float(areas[largest_idx])
+        bbox_area = float(max(widths[largest_idx] * heights[largest_idx], 1.0))
+        small_threshold = max(8.0, clean_area * 0.02)
+        small_area = float(areas[areas <= small_threshold].sum())
+        return {
+            "component_count": float(len(areas)),
+            "largest_component_area": largest_area,
+            "largest_component_ratio": largest_area / max(clean_area, 1),
+            "small_component_ratio": small_area / max(clean_area, 1),
+            "largest_bbox_fill_ratio": largest_area / bbox_area,
+        }
+
+    @classmethod
+    def cluster_spatial_summary(cls, labels_2d: np.ndarray, valid_mask: np.ndarray, k: int, counts: np.ndarray) -> tuple[str, float]:
+        start = time.perf_counter()
+        total = max(int(valid_mask.sum()), 1)
+        rows = []
+        for cluster_id in range(k):
+            raw_cluster = (labels_2d == cluster_id) & valid_mask
+            raw_area = int(raw_cluster.sum())
+            if raw_area <= 0:
+                rows.append(
+                    {
+                        "cluster_id": cluster_id,
+                        "raw_area_ratio": 0.0,
+                        "clean_survival_ratio": 0.0,
+                        "component_count": 0.0,
+                        "largest_component_ratio": 0.0,
+                        "small_component_ratio": 0.0,
+                        "largest_bbox_fill_ratio": 0.0,
+                    }
+                )
+                continue
+
+            clean = cls.morphology_clean(raw_cluster)
+            clean_area = int(clean.sum())
+            cc = cls.connected_component_summary(clean)
+            rows.append(
+                {
+                    "cluster_id": cluster_id,
+                    "raw_area_ratio": raw_area / total,
+                    "clean_survival_ratio": clean_area / max(raw_area, 1),
+                    **cc,
+                }
+            )
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        best = max(
+            rows,
+            key=lambda row: row["clean_survival_ratio"]
+            * row["largest_component_ratio"]
+            * math.log1p(row["raw_area_ratio"] * total),
+        )
+        compact = []
+        for row in rows:
+            compact.append(
+                "C{cluster_id}: area={raw_area_ratio:.1%}, surv={clean_survival_ratio:.2f}, "
+                "L={largest_component_ratio:.2f}, n={component_count:.0f}, small={small_component_ratio:.2f}, fill={largest_bbox_fill_ratio:.2f}".format(
+                    **row
+                )
+            )
+        summary = f"spatial={elapsed_ms:.1f}ms, blob_like=C{int(best['cluster_id'])} | " + " | ".join(compact)
+        return summary, elapsed_ms
+
+    @staticmethod
     def kmeans_cluster_image(array: np.ndarray, k: int, mask: np.ndarray | None = None) -> tuple[np.ndarray, str]:
+        kmeans_start = time.perf_counter()
         k = int(np.clip(k, 2, 8))
         h, w, _ = array.shape
         if mask is not None and mask.shape == (h, w) and mask.any():
@@ -620,6 +772,10 @@ class ImageViewer:
         clustered[valid_mask] = palette[ordered_labels]
         counts = np.bincount(ordered_labels, minlength=k)
         total = max(int(counts.sum()), 1)
+        labels_2d = np.full((h, w), -1, dtype=np.int16)
+        labels_2d[valid_mask] = ordered_labels
+        kmeans_ms = (time.perf_counter() - kmeans_start) * 1000
+        spatial_text, _spatial_ms = ImageViewer.cluster_spatial_summary(labels_2d, valid_mask, k, counts)
         stats = []
         for cluster_id in range(k):
             mean_rgb = ordered_centers[cluster_id]
@@ -627,7 +783,7 @@ class ImageViewer:
             stats.append(
                 f"C{cluster_id}: {rate:.1f}%, RGB=({mean_rgb[0]:.0f},{mean_rgb[1]:.0f},{mean_rgb[2]:.0f})"
             )
-        return clustered, " | ".join(stats)
+        return clustered, f"kmeans={kmeans_ms:.1f}ms | color: {' | '.join(stats)} | {spatial_text}"
 
 
 class GroupCameraFeatureExplorer:

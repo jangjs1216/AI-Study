@@ -173,6 +173,9 @@ class ImageViewer:
         self.refine_open_iter_var = tk.IntVar(value=1)
         self.refine_close_iter_var = tk.IntVar(value=1)
         self.refine_min_area_var = tk.IntVar(value=12)
+        self.overlap_var = tk.BooleanVar(value=False)
+        self.refine_kernel_w_var = tk.IntVar(value=3)
+        self.refine_kernel_h_var = tk.IntVar(value=3)
 
     def _ensure_window(self) -> None:
         if self.window is not None and self.window.winfo_exists():
@@ -274,6 +277,12 @@ class ImageViewer:
             variable=self.cluster_mask_only_var,
             command=self.schedule_render,
         ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Checkbutton(
+            control_frame,
+            text="Overlap",
+            variable=self.overlap_var,
+            command=self.schedule_render,
+        ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(control_frame, text="Reset", command=self.reset_controls).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(control_frame, text="K-Means는 보정/contrast/blur 적용 후 RGB 픽셀값 기준").pack(side=tk.LEFT)
 
@@ -300,6 +309,30 @@ class ImageViewer:
             command=lambda _value: self.schedule_render(),
         )
         refine_kernel_scale.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(refine_tab, text="W").pack(side=tk.LEFT, padx=(0, 4))
+        refine_kernel_w_scale = tk.Scale(
+            refine_tab,
+            from_=1,
+            to=31,
+            resolution=2,
+            orient=tk.HORIZONTAL,
+            variable=self.refine_kernel_w_var,
+            length=150,
+            command=lambda _value: self.schedule_render(),
+        )
+        refine_kernel_w_scale.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(refine_tab, text="H").pack(side=tk.LEFT, padx=(0, 4))
+        refine_kernel_h_scale = tk.Scale(
+            refine_tab,
+            from_=1,
+            to=31,
+            resolution=2,
+            orient=tk.HORIZONTAL,
+            variable=self.refine_kernel_h_var,
+            length=150,
+            command=lambda _value: self.schedule_render(),
+        )
+        refine_kernel_h_scale.pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(refine_tab, text="Open").pack(side=tk.LEFT, padx=(0, 4))
         refine_open_scale = tk.Scale(
             refine_tab,
@@ -438,9 +471,12 @@ class ImageViewer:
         self.cluster_mask_only_var.set(True)
         self.refine_enable_var.set(True)
         self.refine_kernel_var.set(3)
+        self.refine_kernel_w_var.set(3)
+        self.refine_kernel_h_var.set(3)
         self.refine_open_iter_var.set(1)
         self.refine_close_iter_var.set(1)
         self.refine_min_area_var.set(12)
+        self.overlap_var.set(False)
         self.render_images()
 
     def schedule_render(self) -> None:
@@ -468,20 +504,28 @@ class ImageViewer:
             mask=cluster_mask,
             refine_enabled=bool(self.refine_enable_var.get()),
             refine_kernel=int(self.refine_kernel_var.get()),
+            refine_kernel_w=int(self.refine_kernel_w_var.get()),
+            refine_kernel_h=int(self.refine_kernel_h_var.get()),
             refine_open_iter=int(self.refine_open_iter_var.get()),
             refine_close_iter=int(self.refine_close_iter_var.get()),
             refine_min_area=int(self.refine_min_area_var.get()),
         )
+        if self.overlap_var.get():
+            clustered_display = self.overlay_result(adjusted, clustered, alpha=0.8)
+            refined_display = self.overlay_result(adjusted, refined, alpha=0.8)
+        else:
+            clustered_display = clustered
+            refined_display = refined
 
         self.adjusted_photo = ImageTk.PhotoImage(self.to_display_image(adjusted))
-        self.cluster_photo = ImageTk.PhotoImage(self.to_display_image(clustered))
-        self.refined_photo = ImageTk.PhotoImage(self.to_display_image(refined))
+        self.cluster_photo = ImageTk.PhotoImage(self.to_display_image(clustered_display))
+        self.refined_photo = ImageTk.PhotoImage(self.to_display_image(refined_display))
         self.adjusted_image_label.config(image=self.adjusted_photo, text="")
         self.cluster_image_label.config(image=self.cluster_photo, text="")
         self.refined_image_label.config(image=self.refined_photo, text="")
         if self.cluster_stats_label is not None:
             self.cluster_stats_label.config(
-                text=f"contrast={contrast:.2f}, blur={blur_radius:.1f}, K={k}, mask_only={self.cluster_mask_only_var.get()} | {correction_text} | {stats_text}"
+                text=f"contrast={contrast:.2f}, blur={blur_radius:.1f}, K={k}, mask_only={self.cluster_mask_only_var.get()}, overlap={self.overlap_var.get()} | {correction_text} | {stats_text}"
             )
 
     def make_analysis_base(self) -> tuple[np.ndarray, str]:
@@ -516,6 +560,16 @@ class ImageViewer:
             return array
         image = Image.fromarray(array.astype(np.uint8), mode="RGB")
         return np.asarray(image.filter(ImageFilter.GaussianBlur(radius=float(radius))), dtype=np.uint8)
+
+    @staticmethod
+    def overlay_result(base: np.ndarray, overlay: np.ndarray, alpha: float = 0.8) -> np.ndarray:
+        base_f = base.astype(np.float32)
+        overlay_f = overlay.astype(np.float32)
+        overlay_mask = np.any(overlay > 0, axis=2)
+        out = base_f.copy()
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        out[overlay_mask] = (1.0 - alpha) * base_f[overlay_mask] + alpha * overlay_f[overlay_mask]
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     @staticmethod
     def load_rgb_array(path: Path | None, expected_shape: tuple[int, int] | None = None) -> np.ndarray | None:
@@ -667,6 +721,8 @@ class ImageViewer:
         cls,
         mask: np.ndarray,
         kernel_size: int = 3,
+        kernel_w: int | None = None,
+        kernel_h: int | None = None,
         open_iter: int = 1,
         close_iter: int = 1,
     ) -> np.ndarray:
@@ -674,10 +730,20 @@ class ImageViewer:
         kernel_size = int(np.clip(kernel_size, 1, 31))
         if kernel_size % 2 == 0:
             kernel_size += 1
+        if kernel_w is None:
+            kernel_w = kernel_size
+        if kernel_h is None:
+            kernel_h = kernel_size
+        kernel_w = int(np.clip(kernel_w, 1, 31))
+        kernel_h = int(np.clip(kernel_h, 1, 31))
+        if kernel_w % 2 == 0:
+            kernel_w += 1
+        if kernel_h % 2 == 0:
+            kernel_h += 1
         open_iter = int(np.clip(open_iter, 0, 10))
         close_iter = int(np.clip(close_iter, 0, 10))
         if cv2 is not None:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, kernel_h))
             as_u8 = mask_bool.astype(np.uint8)
             opened = cv2.morphologyEx(as_u8, cv2.MORPH_OPEN, kernel, iterations=open_iter) if open_iter else as_u8
             closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=close_iter) if close_iter else opened
@@ -779,6 +845,8 @@ class ImageViewer:
         k: int,
         counts: np.ndarray,
         refine_kernel: int = 3,
+        refine_kernel_w: int | None = None,
+        refine_kernel_h: int | None = None,
         refine_open_iter: int = 1,
         refine_close_iter: int = 1,
         refine_min_area: int = 12,
@@ -807,6 +875,8 @@ class ImageViewer:
             clean = cls.morphology_clean(
                 raw_cluster,
                 kernel_size=refine_kernel,
+                kernel_w=refine_kernel_w,
+                kernel_h=refine_kernel_h,
                 open_iter=refine_open_iter,
                 close_iter=refine_close_iter,
             )
@@ -848,6 +918,8 @@ class ImageViewer:
         mask: np.ndarray | None = None,
         refine_enabled: bool = True,
         refine_kernel: int = 3,
+        refine_kernel_w: int | None = None,
+        refine_kernel_h: int | None = None,
         refine_open_iter: int = 1,
         refine_close_iter: int = 1,
         refine_min_area: int = 12,
@@ -933,6 +1005,8 @@ class ImageViewer:
             k,
             counts,
             refine_kernel=refine_kernel,
+            refine_kernel_w=refine_kernel_w,
+            refine_kernel_h=refine_kernel_h,
             refine_open_iter=refine_open_iter,
             refine_close_iter=refine_close_iter,
             refine_min_area=refine_min_area,
@@ -951,7 +1025,7 @@ class ImageViewer:
                 f"C{cluster_id}: {rate:.1f}%, RGB=({mean_rgb[0]:.0f},{mean_rgb[1]:.0f},{mean_rgb[2]:.0f})"
             )
         refine_text = (
-            f"refine={'on' if refine_enabled else 'off'}, kernel={refine_kernel}, "
+            f"refine={'on' if refine_enabled else 'off'}, kernel={refine_kernel}, kw={refine_kernel_w}, kh={refine_kernel_h}, "
             f"open={refine_open_iter}, close={refine_close_iter}, min_area={refine_min_area}"
         )
         return clustered, refined, f"kmeans={kmeans_ms:.1f}ms | {refine_text} | color: {' | '.join(stats)} | {spatial_text}"

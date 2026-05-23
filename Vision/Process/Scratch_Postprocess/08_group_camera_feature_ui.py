@@ -147,9 +147,11 @@ class ImageViewer:
         self.meta_label: ttk.Label | None = None
         self.adjusted_image_label: ttk.Label | None = None
         self.cluster_image_label: ttk.Label | None = None
+        self.refined_image_label: ttk.Label | None = None
         self.cluster_stats_label: ttk.Label | None = None
         self.adjusted_photo: ImageTk.PhotoImage | None = None
         self.cluster_photo: ImageTk.PhotoImage | None = None
+        self.refined_photo: ImageTk.PhotoImage | None = None
         self.original_array: np.ndarray | None = None
         self.raw_array: np.ndarray | None = None
         self.mask_array: np.ndarray | None = None
@@ -166,6 +168,11 @@ class ImageViewer:
         self.directional_strength_var = tk.DoubleVar(value=0.8)
         self.directional_radius_var = tk.IntVar(value=8)
         self.cluster_mask_only_var = tk.BooleanVar(value=True)
+        self.refine_enable_var = tk.BooleanVar(value=True)
+        self.refine_kernel_var = tk.IntVar(value=3)
+        self.refine_open_iter_var = tk.IntVar(value=1)
+        self.refine_close_iter_var = tk.IntVar(value=1)
+        self.refine_min_area_var = tk.IntVar(value=12)
 
     def _ensure_window(self) -> None:
         if self.window is not None and self.window.winfo_exists():
@@ -173,7 +180,7 @@ class ImageViewer:
 
         self.window = tk.Toplevel(self.master)
         self.window.title("선택 패치 분석")
-        self.window.geometry("1580x900")
+        self.window.geometry("1680x920")
         self.window.protocol("WM_DELETE_WINDOW", self.window.withdraw)
 
         self.meta_label = ttk.Label(self.window, text="", anchor="w", justify="left")
@@ -270,19 +277,84 @@ class ImageViewer:
         ttk.Button(control_frame, text="Reset", command=self.reset_controls).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(control_frame, text="K-Means는 보정/contrast/blur 적용 후 RGB 픽셀값 기준").pack(side=tk.LEFT)
 
+        param_notebook = ttk.Notebook(self.window)
+        param_notebook.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+        refine_tab = ttk.Frame(param_notebook, padding=(8, 6))
+        param_notebook.add(refine_tab, text="Refinement")
+
+        ttk.Checkbutton(
+            refine_tab,
+            text="Refinement 적용",
+            variable=self.refine_enable_var,
+            command=self.schedule_render,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(refine_tab, text="Kernel").pack(side=tk.LEFT, padx=(0, 4))
+        refine_kernel_scale = tk.Scale(
+            refine_tab,
+            from_=1,
+            to=9,
+            resolution=2,
+            orient=tk.HORIZONTAL,
+            variable=self.refine_kernel_var,
+            length=150,
+            command=lambda _value: self.schedule_render(),
+        )
+        refine_kernel_scale.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(refine_tab, text="Open").pack(side=tk.LEFT, padx=(0, 4))
+        refine_open_scale = tk.Scale(
+            refine_tab,
+            from_=0,
+            to=4,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            variable=self.refine_open_iter_var,
+            length=120,
+            command=lambda _value: self.schedule_render(),
+        )
+        refine_open_scale.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(refine_tab, text="Close").pack(side=tk.LEFT, padx=(0, 4))
+        refine_close_scale = tk.Scale(
+            refine_tab,
+            from_=0,
+            to=4,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            variable=self.refine_close_iter_var,
+            length=120,
+            command=lambda _value: self.schedule_render(),
+        )
+        refine_close_scale.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(refine_tab, text="Min area").pack(side=tk.LEFT, padx=(0, 4))
+        refine_area_scale = tk.Scale(
+            refine_tab,
+            from_=0,
+            to=300,
+            resolution=5,
+            orient=tk.HORIZONTAL,
+            variable=self.refine_min_area_var,
+            length=180,
+            command=lambda _value: self.schedule_render(),
+        )
+        refine_area_scale.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(refine_tab, text="각 K-Means cluster별 clean 후 작은 component 제거").pack(side=tk.LEFT)
+
         view_frame = ttk.Frame(self.window)
         view_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
         view_frame.columnconfigure(0, weight=1)
         view_frame.columnconfigure(1, weight=1)
+        view_frame.columnconfigure(2, weight=1)
         view_frame.rowconfigure(1, weight=1)
 
         ttk.Label(view_frame, text="Contrast 조정 이미지", anchor="center").grid(row=0, column=0, sticky="ew", padx=4)
         ttk.Label(view_frame, text="K-Means 그룹 결과", anchor="center").grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Label(view_frame, text="Refinement 결과", anchor="center").grid(row=0, column=2, sticky="ew", padx=4)
 
         self.adjusted_image_label = ttk.Label(view_frame, anchor="center")
         self.adjusted_image_label.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
         self.cluster_image_label = ttk.Label(view_frame, anchor="center")
         self.cluster_image_label.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
+        self.refined_image_label = ttk.Label(view_frame, anchor="center")
+        self.refined_image_label.grid(row=1, column=2, sticky="nsew", padx=4, pady=4)
 
         self.cluster_stats_label = ttk.Label(self.window, text="", anchor="w", justify="left", wraplength=1500)
         self.cluster_stats_label.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 8))
@@ -295,6 +367,8 @@ class ImageViewer:
             self.adjusted_image_label.config(image="", text="이미지를 불러오지 못했습니다.")
         if self.cluster_image_label is not None:
             self.cluster_image_label.config(image="", text="")
+        if self.refined_image_label is not None:
+            self.refined_image_label.config(image="", text="")
         if self.cluster_stats_label is not None:
             self.cluster_stats_label.config(text="")
         self.window.deiconify()
@@ -362,6 +436,11 @@ class ImageViewer:
         self.directional_strength_var.set(0.8)
         self.directional_radius_var.set(8)
         self.cluster_mask_only_var.set(True)
+        self.refine_enable_var.set(True)
+        self.refine_kernel_var.set(3)
+        self.refine_open_iter_var.set(1)
+        self.refine_close_iter_var.set(1)
+        self.refine_min_area_var.set(12)
         self.render_images()
 
     def schedule_render(self) -> None:
@@ -375,7 +454,7 @@ class ImageViewer:
         self.render_after_id = None
         if self.original_array is None:
             return
-        assert self.adjusted_image_label is not None and self.cluster_image_label is not None
+        assert self.adjusted_image_label is not None and self.cluster_image_label is not None and self.refined_image_label is not None
 
         contrast = float(self.contrast_var.get())
         blur_radius = float(self.blur_var.get())
@@ -383,12 +462,23 @@ class ImageViewer:
         base, correction_text = self.make_analysis_base()
         adjusted = self.apply_blur(self.apply_contrast(base, contrast), blur_radius)
         cluster_mask = self.mask_array if self.cluster_mask_only_var.get() else None
-        clustered, stats_text = self.kmeans_cluster_image(adjusted, k, mask=cluster_mask)
+        clustered, refined, stats_text = self.kmeans_cluster_image(
+            adjusted,
+            k,
+            mask=cluster_mask,
+            refine_enabled=bool(self.refine_enable_var.get()),
+            refine_kernel=int(self.refine_kernel_var.get()),
+            refine_open_iter=int(self.refine_open_iter_var.get()),
+            refine_close_iter=int(self.refine_close_iter_var.get()),
+            refine_min_area=int(self.refine_min_area_var.get()),
+        )
 
         self.adjusted_photo = ImageTk.PhotoImage(self.to_display_image(adjusted))
         self.cluster_photo = ImageTk.PhotoImage(self.to_display_image(clustered))
+        self.refined_photo = ImageTk.PhotoImage(self.to_display_image(refined))
         self.adjusted_image_label.config(image=self.adjusted_photo, text="")
         self.cluster_image_label.config(image=self.cluster_photo, text="")
+        self.refined_image_label.config(image=self.refined_photo, text="")
         if self.cluster_stats_label is not None:
             self.cluster_stats_label.config(
                 text=f"contrast={contrast:.2f}, blur={blur_radius:.1f}, K={k}, mask_only={self.cluster_mask_only_var.get()} | {correction_text} | {stats_text}"
@@ -573,17 +663,51 @@ class ImageViewer:
         return out
 
     @classmethod
-    def morphology_clean(cls, mask: np.ndarray) -> np.ndarray:
+    def morphology_clean(
+        cls,
+        mask: np.ndarray,
+        kernel_size: int = 3,
+        open_iter: int = 1,
+        close_iter: int = 1,
+    ) -> np.ndarray:
         mask_bool = mask.astype(bool)
+        kernel_size = int(np.clip(kernel_size, 1, 31))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        open_iter = int(np.clip(open_iter, 0, 10))
+        close_iter = int(np.clip(close_iter, 0, 10))
         if cv2 is not None:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
             as_u8 = mask_bool.astype(np.uint8)
-            opened = cv2.morphologyEx(as_u8, cv2.MORPH_OPEN, kernel)
-            closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
+            opened = cv2.morphologyEx(as_u8, cv2.MORPH_OPEN, kernel, iterations=open_iter) if open_iter else as_u8
+            closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel, iterations=close_iter) if close_iter else opened
             return closed.astype(bool)
-        opened = cls.binary_dilate(cls.binary_erode(mask_bool))
-        closed = cls.binary_erode(cls.binary_dilate(opened))
+
+        opened = mask_bool
+        for _ in range(open_iter):
+            opened = cls.binary_dilate(cls.binary_erode(opened))
+        closed = opened
+        for _ in range(close_iter):
+            closed = cls.binary_erode(cls.binary_dilate(closed))
         return closed
+
+    @classmethod
+    def remove_small_components(cls, mask: np.ndarray, min_area: int) -> np.ndarray:
+        mask_bool = mask.astype(bool)
+        min_area = int(max(min_area, 0))
+        if min_area <= 1 or not mask_bool.any():
+            return mask_bool
+
+        if cv2 is not None:
+            num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask_bool.astype(np.uint8), connectivity=8)
+            keep = np.zeros(num_labels, dtype=bool)
+            keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_area
+            return keep[labels]
+
+        out = np.zeros_like(mask_bool, dtype=bool)
+        for coords in cls.connected_components_bool(mask_bool, min_area=min_area):
+            out[coords[:, 0], coords[:, 1]] = True
+        return out
 
     @classmethod
     def connected_component_summary(cls, mask: np.ndarray) -> dict[str, float]:
@@ -648,10 +772,21 @@ class ImageViewer:
         }
 
     @classmethod
-    def cluster_spatial_summary(cls, labels_2d: np.ndarray, valid_mask: np.ndarray, k: int, counts: np.ndarray) -> tuple[str, float]:
+    def cluster_spatial_summary(
+        cls,
+        labels_2d: np.ndarray,
+        valid_mask: np.ndarray,
+        k: int,
+        counts: np.ndarray,
+        refine_kernel: int = 3,
+        refine_open_iter: int = 1,
+        refine_close_iter: int = 1,
+        refine_min_area: int = 12,
+    ) -> tuple[str, float, list[dict[str, float]], np.ndarray]:
         start = time.perf_counter()
         total = max(int(valid_mask.sum()), 1)
         rows = []
+        refined_labels = np.full(labels_2d.shape, -1, dtype=np.int16)
         for cluster_id in range(k):
             raw_cluster = (labels_2d == cluster_id) & valid_mask
             raw_area = int(raw_cluster.sum())
@@ -669,7 +804,14 @@ class ImageViewer:
                 )
                 continue
 
-            clean = cls.morphology_clean(raw_cluster)
+            clean = cls.morphology_clean(
+                raw_cluster,
+                kernel_size=refine_kernel,
+                open_iter=refine_open_iter,
+                close_iter=refine_close_iter,
+            )
+            clean = cls.remove_small_components(clean, min_area=refine_min_area)
+            refined_labels[clean] = cluster_id
             clean_area = int(clean.sum())
             cc = cls.connected_component_summary(clean)
             rows.append(
@@ -697,10 +839,19 @@ class ImageViewer:
                 )
             )
         summary = f"spatial={elapsed_ms:.1f}ms, blob_like=C{int(best['cluster_id'])} | " + " | ".join(compact)
-        return summary, elapsed_ms
+        return summary, elapsed_ms, rows, refined_labels
 
     @staticmethod
-    def kmeans_cluster_image(array: np.ndarray, k: int, mask: np.ndarray | None = None) -> tuple[np.ndarray, str]:
+    def kmeans_cluster_image(
+        array: np.ndarray,
+        k: int,
+        mask: np.ndarray | None = None,
+        refine_enabled: bool = True,
+        refine_kernel: int = 3,
+        refine_open_iter: int = 1,
+        refine_close_iter: int = 1,
+        refine_min_area: int = 12,
+    ) -> tuple[np.ndarray, np.ndarray, str]:
         kmeans_start = time.perf_counter()
         k = int(np.clip(k, 2, 8))
         h, w, _ = array.shape
@@ -713,7 +864,8 @@ class ImageViewer:
         rng = np.random.default_rng(17)
         sample_size = min(25000, len(pixels))
         if sample_size <= 0:
-            return np.zeros_like(array), "no valid pixels"
+            empty = np.zeros_like(array)
+            return empty, empty, "no valid pixels"
         sample_idx = rng.choice(len(pixels), size=sample_size, replace=False)
         sample = pixels[sample_idx]
 
@@ -775,7 +927,22 @@ class ImageViewer:
         labels_2d = np.full((h, w), -1, dtype=np.int16)
         labels_2d[valid_mask] = ordered_labels
         kmeans_ms = (time.perf_counter() - kmeans_start) * 1000
-        spatial_text, _spatial_ms = ImageViewer.cluster_spatial_summary(labels_2d, valid_mask, k, counts)
+        spatial_text, _spatial_ms, _rows, refined_labels = ImageViewer.cluster_spatial_summary(
+            labels_2d,
+            valid_mask,
+            k,
+            counts,
+            refine_kernel=refine_kernel,
+            refine_open_iter=refine_open_iter,
+            refine_close_iter=refine_close_iter,
+            refine_min_area=refine_min_area,
+        )
+        if refine_enabled:
+            refined = np.zeros((h, w, 3), dtype=np.uint8)
+            refined_valid = refined_labels >= 0
+            refined[refined_valid] = palette[refined_labels[refined_valid]]
+        else:
+            refined = clustered.copy()
         stats = []
         for cluster_id in range(k):
             mean_rgb = ordered_centers[cluster_id]
@@ -783,7 +950,11 @@ class ImageViewer:
             stats.append(
                 f"C{cluster_id}: {rate:.1f}%, RGB=({mean_rgb[0]:.0f},{mean_rgb[1]:.0f},{mean_rgb[2]:.0f})"
             )
-        return clustered, f"kmeans={kmeans_ms:.1f}ms | color: {' | '.join(stats)} | {spatial_text}"
+        refine_text = (
+            f"refine={'on' if refine_enabled else 'off'}, kernel={refine_kernel}, "
+            f"open={refine_open_iter}, close={refine_close_iter}, min_area={refine_min_area}"
+        )
+        return clustered, refined, f"kmeans={kmeans_ms:.1f}ms | {refine_text} | color: {' | '.join(stats)} | {spatial_text}"
 
 
 class GroupCameraFeatureExplorer:

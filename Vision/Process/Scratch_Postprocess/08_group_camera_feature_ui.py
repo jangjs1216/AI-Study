@@ -42,6 +42,7 @@ CAMERA_PATTERN = re.compile(r"\[([^\[\]]+)\](?=\.[^.]+$)")
 ID_LIKE_COLUMNS = {
     "image_path",
     "mask_path",
+    "mask_raw_path",
     "component_id",
     "group",
     "camera_mode",
@@ -146,6 +147,9 @@ class ImageViewer:
         self.original_array: np.ndarray | None = None
         self.current_path: Path | None = None
         self.current_meta = ""
+        self.source_paths: dict[str, Path] = {}
+        self.source_var = tk.StringVar(value="image_path")
+        self.source_combo: ttk.Combobox | None = None
         self.render_after_id: str | None = None
         self.contrast_var = tk.DoubleVar(value=1.0)
         self.cluster_k_var = tk.IntVar(value=4)
@@ -164,6 +168,17 @@ class ImageViewer:
 
         control_frame = ttk.LabelFrame(self.window, text="시각화 조정", padding=(8, 6))
         control_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+
+        ttk.Label(control_frame, text="Source").pack(side=tk.LEFT, padx=(0, 6))
+        self.source_combo = ttk.Combobox(
+            control_frame,
+            textvariable=self.source_var,
+            state="readonly",
+            width=14,
+            values=[],
+        )
+        self.source_combo.pack(side=tk.LEFT, padx=(0, 18))
+        self.source_combo.bind("<<ComboboxSelected>>", lambda _event: self.load_selected_source())
 
         ttk.Label(control_frame, text="Contrast").pack(side=tk.LEFT, padx=(0, 6))
         contrast_scale = tk.Scale(
@@ -223,24 +238,53 @@ class ImageViewer:
         self.window.deiconify()
         self.window.lift()
 
-    def update(self, image_path: Path, meta_text: str) -> None:
+    def update(self, image_paths: dict[str, Path], meta_text: str) -> None:
         self._ensure_window()
         assert self.window is not None and self.meta_label is not None
+
+        if not image_paths:
+            self.show_error(f"{meta_text}\n\n분석 가능한 이미지 경로가 없습니다.")
+            return
+
+        previous_source = self.source_var.get()
+        self.source_paths = image_paths
+        if self.source_combo is not None:
+            self.source_combo["values"] = list(image_paths.keys())
+        if previous_source in image_paths:
+            self.source_var.set(previous_source)
+        elif "image_path" in image_paths:
+            self.source_var.set("image_path")
+        elif "mask_raw_path" in image_paths:
+            self.source_var.set("mask_raw_path")
+        else:
+            self.source_var.set(next(iter(image_paths.keys())))
+
+        self.current_meta = meta_text
+        self.load_selected_source()
+        self.window.deiconify()
+        self.window.lift()
+
+    def load_selected_source(self) -> None:
+        self._ensure_window()
+        assert self.window is not None and self.meta_label is not None
+
+        source_name = self.source_var.get()
+        image_path = self.source_paths.get(source_name)
+        if image_path is None:
+            self.show_error(f"{self.current_meta}\n\n선택한 source 경로를 찾지 못했습니다: {source_name}")
+            return
 
         try:
             with Image.open(image_path) as img:
                 img = img.convert("RGB")
                 self.original_array = np.asarray(img, dtype=np.uint8).copy()
         except Exception as exc:  # noqa: BLE001
-            self.show_error(f"{meta_text}\n\n이미지 로딩 실패: {image_path}\n{exc}")
+            self.show_error(f"{self.current_meta}\n\n이미지 로딩 실패: [{source_name}] {image_path}\n{exc}")
             return
 
         self.current_path = image_path
-        self.current_meta = meta_text
-        self.meta_label.config(text=f"{meta_text}\nimage: {image_path}")
+        self.meta_label.config(text=f"{self.current_meta}\nsource: {source_name}\nimage: {image_path}")
         self.render_images()
-        self.window.deiconify()
-        self.window.lift()
 
     def reset_controls(self) -> None:
         self.contrast_var.set(1.0)
@@ -1133,7 +1177,6 @@ class GroupCameraFeatureExplorer:
         self.show_row_image(row)
 
     def show_row_image(self, row: pd.Series) -> None:
-        image_path = self.resolve_image_path(row.get("image_path"))
         feature = self.feature_var.get()
         value = row.get(feature, "")
         meta = (
@@ -1141,10 +1184,23 @@ class GroupCameraFeatureExplorer:
             f"group={row.get('group')} | camera={row.get('camera_mode')} | "
             f"defect_type={row.get('defect_type')} | {feature}={self.format_number(value)}"
         )
-        if image_path is None:
-            self.image_viewer.show_error(f"{meta}\n\n이미지 파일을 찾지 못했습니다: {row.get('image_path')}")
+
+        image_paths: dict[str, Path] = {}
+        missing_sources: list[str] = []
+        for source_name in ["image_path", "mask_raw_path", "mask_path"]:
+            if source_name not in row.index:
+                continue
+            resolved = self.resolve_image_path(row.get(source_name))
+            if resolved is not None:
+                image_paths[source_name] = resolved
+            elif not pd.isna(row.get(source_name)) and str(row.get(source_name)).strip():
+                missing_sources.append(f"{source_name}={row.get(source_name)}")
+
+        if not image_paths:
+            missing_text = "\n".join(missing_sources) if missing_sources else "image_path/mask_raw_path/mask_path 값이 없습니다."
+            self.image_viewer.show_error(f"{meta}\n\n이미지 파일을 찾지 못했습니다:\n{missing_text}")
             return
-        self.image_viewer.update(image_path, meta)
+        self.image_viewer.update(image_paths, meta)
 
     def resolve_image_path(self, value: object) -> Path | None:
         if pd.isna(value):

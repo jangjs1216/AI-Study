@@ -137,51 +137,225 @@ class ImageViewer:
     def __init__(self, master: tk.Tk) -> None:
         self.master = master
         self.window: tk.Toplevel | None = None
-        self.image_label: ttk.Label | None = None
         self.meta_label: ttk.Label | None = None
-        self.photo: ImageTk.PhotoImage | None = None
+        self.adjusted_image_label: ttk.Label | None = None
+        self.cluster_image_label: ttk.Label | None = None
+        self.cluster_stats_label: ttk.Label | None = None
+        self.adjusted_photo: ImageTk.PhotoImage | None = None
+        self.cluster_photo: ImageTk.PhotoImage | None = None
+        self.original_array: np.ndarray | None = None
+        self.current_path: Path | None = None
+        self.current_meta = ""
+        self.render_after_id: str | None = None
+        self.contrast_var = tk.DoubleVar(value=1.0)
+        self.cluster_k_var = tk.IntVar(value=4)
 
     def _ensure_window(self) -> None:
         if self.window is not None and self.window.winfo_exists():
             return
 
         self.window = tk.Toplevel(self.master)
-        self.window.title("선택 이미지")
-        self.window.geometry("980x820")
+        self.window.title("선택 패치 분석")
+        self.window.geometry("1180x860")
         self.window.protocol("WM_DELETE_WINDOW", self.window.withdraw)
 
         self.meta_label = ttk.Label(self.window, text="", anchor="w", justify="left")
         self.meta_label.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
 
-        self.image_label = ttk.Label(self.window, anchor="center")
-        self.image_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        control_frame = ttk.LabelFrame(self.window, text="시각화 조정", padding=(8, 6))
+        control_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+
+        ttk.Label(control_frame, text="Contrast").pack(side=tk.LEFT, padx=(0, 6))
+        contrast_scale = tk.Scale(
+            control_frame,
+            from_=0.2,
+            to=3.0,
+            resolution=0.05,
+            orient=tk.HORIZONTAL,
+            variable=self.contrast_var,
+            length=260,
+            command=lambda _value: self.schedule_render(),
+        )
+        contrast_scale.pack(side=tk.LEFT, padx=(0, 18))
+
+        ttk.Label(control_frame, text="K 그룹").pack(side=tk.LEFT, padx=(0, 6))
+        k_scale = tk.Scale(
+            control_frame,
+            from_=2,
+            to=8,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            variable=self.cluster_k_var,
+            length=190,
+            command=lambda _value: self.schedule_render(),
+        )
+        k_scale.pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Button(control_frame, text="Reset", command=self.reset_controls).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(control_frame, text="K-Means는 contrast 조정 후 RGB 픽셀값을 기준으로 계산").pack(side=tk.LEFT)
+
+        view_frame = ttk.Frame(self.window)
+        view_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        view_frame.columnconfigure(0, weight=1)
+        view_frame.columnconfigure(1, weight=1)
+        view_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(view_frame, text="Contrast 조정 이미지", anchor="center").grid(row=0, column=0, sticky="ew", padx=4)
+        ttk.Label(view_frame, text="K-Means 그룹 결과", anchor="center").grid(row=0, column=1, sticky="ew", padx=4)
+
+        self.adjusted_image_label = ttk.Label(view_frame, anchor="center")
+        self.adjusted_image_label.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        self.cluster_image_label = ttk.Label(view_frame, anchor="center")
+        self.cluster_image_label.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
+
+        self.cluster_stats_label = ttk.Label(self.window, text="", anchor="w", justify="left")
+        self.cluster_stats_label.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 8))
 
     def show_error(self, message: str) -> None:
         self._ensure_window()
-        assert self.window is not None and self.meta_label is not None and self.image_label is not None
-        self.photo = None
+        assert self.window is not None and self.meta_label is not None
         self.meta_label.config(text=message)
-        self.image_label.config(image="", text="이미지를 불러오지 못했습니다.")
+        if self.adjusted_image_label is not None:
+            self.adjusted_image_label.config(image="", text="이미지를 불러오지 못했습니다.")
+        if self.cluster_image_label is not None:
+            self.cluster_image_label.config(image="", text="")
+        if self.cluster_stats_label is not None:
+            self.cluster_stats_label.config(text="")
         self.window.deiconify()
         self.window.lift()
 
     def update(self, image_path: Path, meta_text: str) -> None:
         self._ensure_window()
-        assert self.window is not None and self.meta_label is not None and self.image_label is not None
+        assert self.window is not None and self.meta_label is not None
 
         try:
             with Image.open(image_path) as img:
                 img = img.convert("RGB")
-                img.thumbnail((940, 720), Image.Resampling.LANCZOS)
-                self.photo = ImageTk.PhotoImage(img)
+                self.original_array = np.asarray(img, dtype=np.uint8).copy()
         except Exception as exc:  # noqa: BLE001
             self.show_error(f"{meta_text}\n\n이미지 로딩 실패: {image_path}\n{exc}")
             return
 
+        self.current_path = image_path
+        self.current_meta = meta_text
         self.meta_label.config(text=f"{meta_text}\nimage: {image_path}")
-        self.image_label.config(image=self.photo, text="")
+        self.render_images()
         self.window.deiconify()
         self.window.lift()
+
+    def reset_controls(self) -> None:
+        self.contrast_var.set(1.0)
+        self.cluster_k_var.set(4)
+        self.render_images()
+
+    def schedule_render(self) -> None:
+        if self.window is None or not self.window.winfo_exists():
+            return
+        if self.render_after_id is not None:
+            self.window.after_cancel(self.render_after_id)
+        self.render_after_id = self.window.after(120, self.render_images)
+
+    def render_images(self) -> None:
+        self.render_after_id = None
+        if self.original_array is None:
+            return
+        assert self.adjusted_image_label is not None and self.cluster_image_label is not None
+
+        contrast = float(self.contrast_var.get())
+        k = int(self.cluster_k_var.get())
+        adjusted = self.apply_contrast(self.original_array, contrast)
+        clustered, stats_text = self.kmeans_cluster_image(adjusted, k)
+
+        self.adjusted_photo = ImageTk.PhotoImage(self.to_display_image(adjusted))
+        self.cluster_photo = ImageTk.PhotoImage(self.to_display_image(clustered))
+        self.adjusted_image_label.config(image=self.adjusted_photo, text="")
+        self.cluster_image_label.config(image=self.cluster_photo, text="")
+        if self.cluster_stats_label is not None:
+            self.cluster_stats_label.config(text=f"contrast={contrast:.2f}, K={k} | {stats_text}")
+
+    @staticmethod
+    def apply_contrast(array: np.ndarray, contrast: float) -> np.ndarray:
+        arr = array.astype(np.float32)
+        adjusted = (arr - 127.5) * contrast + 127.5
+        return np.clip(adjusted, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def to_display_image(array: np.ndarray) -> Image.Image:
+        image = Image.fromarray(array.astype(np.uint8), mode="RGB")
+        image.thumbnail((550, 650), Image.Resampling.LANCZOS)
+        return image
+
+    @staticmethod
+    def kmeans_cluster_image(array: np.ndarray, k: int) -> tuple[np.ndarray, str]:
+        k = int(np.clip(k, 2, 8))
+        h, w, _ = array.shape
+        pixels = array.reshape(-1, 3).astype(np.float32)
+        rng = np.random.default_rng(17)
+        sample_size = min(25000, len(pixels))
+        sample_idx = rng.choice(len(pixels), size=sample_size, replace=False)
+        sample = pixels[sample_idx]
+
+        luma = sample @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        quantiles = np.linspace(0.05, 0.95, k)
+        centers = []
+        for q in quantiles:
+            target = np.quantile(luma, q)
+            centers.append(sample[int(np.argmin(np.abs(luma - target)))])
+        centers = np.asarray(centers, dtype=np.float32)
+
+        for _ in range(14):
+            distances = ((sample[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+            labels = distances.argmin(axis=1)
+            new_centers = centers.copy()
+            for cluster_id in range(k):
+                cluster_pixels = sample[labels == cluster_id]
+                if len(cluster_pixels):
+                    new_centers[cluster_id] = cluster_pixels.mean(axis=0)
+                else:
+                    new_centers[cluster_id] = sample[rng.integers(0, len(sample))]
+            if np.allclose(new_centers, centers, atol=0.5):
+                centers = new_centers
+                break
+            centers = new_centers
+
+        all_labels = np.empty(len(pixels), dtype=np.int16)
+        chunk = 100000
+        for start in range(0, len(pixels), chunk):
+            stop = min(start + chunk, len(pixels))
+            distances = ((pixels[start:stop, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+            all_labels[start:stop] = distances.argmin(axis=1)
+
+        center_luma = centers @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        order = np.argsort(center_luma)
+        remap = np.zeros(k, dtype=np.int16)
+        for new_id, old_id in enumerate(order):
+            remap[old_id] = new_id
+        ordered_labels = remap[all_labels]
+        ordered_centers = centers[order]
+
+        palette = np.array(
+            [
+                [31, 119, 180],
+                [255, 127, 14],
+                [44, 160, 44],
+                [214, 39, 40],
+                [148, 103, 189],
+                [140, 86, 75],
+                [227, 119, 194],
+                [127, 127, 127],
+            ],
+            dtype=np.uint8,
+        )
+        clustered = palette[ordered_labels].reshape(h, w, 3)
+        counts = np.bincount(ordered_labels, minlength=k)
+        total = max(int(counts.sum()), 1)
+        stats = []
+        for cluster_id in range(k):
+            mean_rgb = ordered_centers[cluster_id]
+            rate = counts[cluster_id] / total * 100
+            stats.append(
+                f"C{cluster_id}: {rate:.1f}%, RGB=({mean_rgb[0]:.0f},{mean_rgb[1]:.0f},{mean_rgb[2]:.0f})"
+            )
+        return clustered, " | ".join(stats)
 
 
 class GroupCameraFeatureExplorer:

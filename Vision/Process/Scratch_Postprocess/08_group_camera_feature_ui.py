@@ -176,6 +176,7 @@ class ImageViewer:
         self.overlap_var = tk.BooleanVar(value=False)
         self.refine_kernel_w_var = tk.IntVar(value=3)
         self.refine_kernel_h_var = tk.IntVar(value=3)
+        self.refine_angle_var = tk.BooleanVar(value=False)
 
     def _ensure_window(self) -> None:
         if self.window is not None and self.window.winfo_exists():
@@ -295,6 +296,12 @@ class ImageViewer:
             refine_tab,
             text="Refinement 적용",
             variable=self.refine_enable_var,
+            command=self.schedule_render,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(
+            refine_tab,
+            text="Angle",
+            variable=self.refine_angle_var,
             command=self.schedule_render,
         ).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(refine_tab, text="Kernel").pack(side=tk.LEFT, padx=(0, 4))
@@ -470,6 +477,7 @@ class ImageViewer:
         self.directional_radius_var.set(8)
         self.cluster_mask_only_var.set(True)
         self.refine_enable_var.set(True)
+        self.refine_angle_var.set(False)
         self.refine_kernel_var.set(3)
         self.refine_kernel_w_var.set(3)
         self.refine_kernel_h_var.set(3)
@@ -506,6 +514,7 @@ class ImageViewer:
             refine_kernel=int(self.refine_kernel_var.get()),
             refine_kernel_w=int(self.refine_kernel_w_var.get()),
             refine_kernel_h=int(self.refine_kernel_h_var.get()),
+            refine_angle_enabled=bool(self.refine_angle_var.get()),
             refine_open_iter=int(self.refine_open_iter_var.get()),
             refine_close_iter=int(self.refine_close_iter_var.get()),
             refine_min_area=int(self.refine_min_area_var.get()),
@@ -639,6 +648,26 @@ class ImageViewer:
         return perp_y / norm, perp_x / norm
 
     @staticmethod
+    def component_major_angle_deg(coords_yx: np.ndarray) -> float:
+        coords_xy = coords_yx[:, [1, 0]].astype(np.float32)
+        if len(coords_xy) < 2:
+            return 0.0
+
+        if cv2 is not None and len(coords_xy) >= 5:
+            rect = cv2.minAreaRect(coords_xy)
+            width, height = rect[1]
+            angle = float(rect[2])
+            if width < height:
+                angle += 90.0
+            return angle
+
+        centered = coords_xy - coords_xy.mean(axis=0, keepdims=True)
+        cov = np.cov(centered.T)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        major_vec = eigvecs[:, int(np.argmax(eigvals))]
+        return math.degrees(math.atan2(float(major_vec[1]), float(major_vec[0])))
+
+    @staticmethod
     def sample_perpendicular_background(
         raw_array: np.ndarray,
         mask: np.ndarray,
@@ -716,6 +745,36 @@ class ImageViewer:
                 out &= padded[dy : dy + mask.shape[0], dx : dx + mask.shape[1]]
         return out
 
+    @staticmethod
+    def binary_dilate_rect(mask: np.ndarray, kernel_w: int, kernel_h: int) -> np.ndarray:
+        mask_bool = mask.astype(bool)
+        rx = max(int(kernel_w) // 2, 0)
+        ry = max(int(kernel_h) // 2, 0)
+        padded_x = np.pad(mask_bool, ((0, 0), (rx, rx)), mode="constant", constant_values=False)
+        horiz = np.zeros_like(mask_bool, dtype=bool)
+        for dx in range(2 * rx + 1):
+            horiz |= padded_x[:, dx : dx + mask_bool.shape[1]]
+        padded_y = np.pad(horiz, ((ry, ry), (0, 0)), mode="constant", constant_values=False)
+        out = np.zeros_like(mask_bool, dtype=bool)
+        for dy in range(2 * ry + 1):
+            out |= padded_y[dy : dy + mask_bool.shape[0], :]
+        return out
+
+    @staticmethod
+    def binary_erode_rect(mask: np.ndarray, kernel_w: int, kernel_h: int) -> np.ndarray:
+        mask_bool = mask.astype(bool)
+        rx = max(int(kernel_w) // 2, 0)
+        ry = max(int(kernel_h) // 2, 0)
+        padded_x = np.pad(mask_bool, ((0, 0), (rx, rx)), mode="constant", constant_values=False)
+        horiz = np.ones_like(mask_bool, dtype=bool)
+        for dx in range(2 * rx + 1):
+            horiz &= padded_x[:, dx : dx + mask_bool.shape[1]]
+        padded_y = np.pad(horiz, ((ry, ry), (0, 0)), mode="constant", constant_values=False)
+        out = np.ones_like(mask_bool, dtype=bool)
+        for dy in range(2 * ry + 1):
+            out &= padded_y[dy : dy + mask_bool.shape[0], :]
+        return out
+
     @classmethod
     def morphology_clean(
         cls,
@@ -751,10 +810,10 @@ class ImageViewer:
 
         opened = mask_bool
         for _ in range(open_iter):
-            opened = cls.binary_dilate(cls.binary_erode(opened))
+            opened = cls.binary_dilate_rect(cls.binary_erode_rect(opened, kernel_w, kernel_h), kernel_w, kernel_h)
         closed = opened
         for _ in range(close_iter):
-            closed = cls.binary_erode(cls.binary_dilate(closed))
+            closed = cls.binary_erode_rect(cls.binary_dilate_rect(closed, kernel_w, kernel_h), kernel_w, kernel_h)
         return closed
 
     @classmethod
@@ -774,6 +833,117 @@ class ImageViewer:
         for coords in cls.connected_components_bool(mask_bool, min_area=min_area):
             out[coords[:, 0], coords[:, 1]] = True
         return out
+
+    @staticmethod
+    def rotate_binary_patch(mask: np.ndarray, angle_deg: float) -> np.ndarray:
+        image = Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
+        rotated = image.rotate(
+            angle=float(angle_deg),
+            resample=Image.Resampling.NEAREST,
+            expand=False,
+            fillcolor=0,
+        )
+        return np.asarray(rotated, dtype=np.uint8) > 0
+
+    @classmethod
+    def morphology_clean_angle_aligned(
+        cls,
+        cluster_mask: np.ndarray,
+        angle_mask: np.ndarray,
+        kernel_size: int = 3,
+        kernel_w: int | None = None,
+        kernel_h: int | None = None,
+        open_iter: int = 1,
+        close_iter: int = 1,
+    ) -> tuple[np.ndarray, int]:
+        cluster_bool = cluster_mask.astype(bool)
+        angle_bool = angle_mask.astype(bool)
+        if not angle_bool.any():
+            angle_bool = cluster_bool
+
+        kernel_size = int(np.clip(kernel_size, 1, 31))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        if kernel_w is None:
+            kernel_w = kernel_size
+        if kernel_h is None:
+            kernel_h = kernel_size
+        kernel_w = int(np.clip(kernel_w, 1, 31))
+        kernel_h = int(np.clip(kernel_h, 1, 31))
+        if kernel_w % 2 == 0:
+            kernel_w += 1
+        if kernel_h % 2 == 0:
+            kernel_h += 1
+        open_iter = int(np.clip(open_iter, 0, 10))
+        close_iter = int(np.clip(close_iter, 0, 10))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, kernel_h)) if cv2 is not None else None
+
+        out = np.zeros_like(cluster_bool, dtype=bool)
+        h, w = cluster_bool.shape
+        pad = max(kernel_w, kernel_h, 5) * 2
+        components = cls.connected_components_bool(angle_bool, min_area=8)
+        if not components:
+            components = cls.connected_components_bool(cluster_bool, min_area=1)
+
+        angle_component_count = 0
+        for coords in components:
+            yy = coords[:, 0]
+            xx = coords[:, 1]
+            y0 = max(int(yy.min()) - pad, 0)
+            y1 = min(int(yy.max()) + pad + 1, h)
+            x0 = max(int(xx.min()) - pad, 0)
+            x1 = min(int(xx.max()) + pad + 1, w)
+
+            patch_cluster = cluster_bool[y0:y1, x0:x1]
+            component_patch = np.zeros_like(patch_cluster, dtype=bool)
+            component_patch[yy - y0, xx - x0] = True
+            patch_input = patch_cluster & component_patch
+            if not patch_input.any():
+                continue
+
+            angle = cls.component_major_angle_deg(coords)
+            patch_h, patch_w = patch_input.shape
+            center = ((patch_w - 1) / 2.0, (patch_h - 1) / 2.0)
+
+            if cv2 is not None:
+                rotate_to_axis = cv2.getRotationMatrix2D(center, -angle, 1.0)
+                rotated = cv2.warpAffine(
+                    patch_input.astype(np.uint8),
+                    rotate_to_axis,
+                    (patch_w, patch_h),
+                    flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                if open_iter:
+                    rotated = cv2.morphologyEx(rotated, cv2.MORPH_OPEN, kernel, iterations=open_iter)
+                if close_iter:
+                    rotated = cv2.morphologyEx(rotated, cv2.MORPH_CLOSE, kernel, iterations=close_iter)
+
+                rotate_back = cv2.getRotationMatrix2D(center, angle, 1.0)
+                restored = cv2.warpAffine(
+                    rotated,
+                    rotate_back,
+                    (patch_w, patch_h),
+                    flags=cv2.INTER_NEAREST,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                ).astype(bool)
+            else:
+                rotated = cls.rotate_binary_patch(patch_input, -angle)
+                cleaned = cls.morphology_clean(
+                    rotated,
+                    kernel_size=kernel_size,
+                    kernel_w=kernel_w,
+                    kernel_h=kernel_h,
+                    open_iter=open_iter,
+                    close_iter=close_iter,
+                )
+                restored = cls.rotate_binary_patch(cleaned, angle)
+            out[y0:y1, x0:x1] |= restored & component_patch
+            angle_component_count += 1
+
+        return out, angle_component_count
 
     @classmethod
     def connected_component_summary(cls, mask: np.ndarray) -> dict[str, float]:
@@ -847,6 +1017,7 @@ class ImageViewer:
         refine_kernel: int = 3,
         refine_kernel_w: int | None = None,
         refine_kernel_h: int | None = None,
+        refine_angle_enabled: bool = False,
         refine_open_iter: int = 1,
         refine_close_iter: int = 1,
         refine_min_area: int = 12,
@@ -855,6 +1026,7 @@ class ImageViewer:
         total = max(int(valid_mask.sum()), 1)
         rows = []
         refined_labels = np.full(labels_2d.shape, -1, dtype=np.int16)
+        angle_component_total = 0
         for cluster_id in range(k):
             raw_cluster = (labels_2d == cluster_id) & valid_mask
             raw_area = int(raw_cluster.sum())
@@ -872,14 +1044,26 @@ class ImageViewer:
                 )
                 continue
 
-            clean = cls.morphology_clean(
-                raw_cluster,
-                kernel_size=refine_kernel,
-                kernel_w=refine_kernel_w,
-                kernel_h=refine_kernel_h,
-                open_iter=refine_open_iter,
-                close_iter=refine_close_iter,
-            )
+            if refine_angle_enabled:
+                clean, angle_component_count = cls.morphology_clean_angle_aligned(
+                    raw_cluster,
+                    angle_mask=valid_mask,
+                    kernel_size=refine_kernel,
+                    kernel_w=refine_kernel_w,
+                    kernel_h=refine_kernel_h,
+                    open_iter=refine_open_iter,
+                    close_iter=refine_close_iter,
+                )
+                angle_component_total += angle_component_count
+            else:
+                clean = cls.morphology_clean(
+                    raw_cluster,
+                    kernel_size=refine_kernel,
+                    kernel_w=refine_kernel_w,
+                    kernel_h=refine_kernel_h,
+                    open_iter=refine_open_iter,
+                    close_iter=refine_close_iter,
+                )
             clean = cls.remove_small_components(clean, min_area=refine_min_area)
             refined_labels[clean] = cluster_id
             clean_area = int(clean.sum())
@@ -908,7 +1092,8 @@ class ImageViewer:
                     **row
                 )
             )
-        summary = f"spatial={elapsed_ms:.1f}ms, blob_like=C{int(best['cluster_id'])} | " + " | ".join(compact)
+        angle_text = f", angle_components={angle_component_total}" if refine_angle_enabled else ""
+        summary = f"spatial={elapsed_ms:.1f}ms, blob_like=C{int(best['cluster_id'])}{angle_text} | " + " | ".join(compact)
         return summary, elapsed_ms, rows, refined_labels
 
     @staticmethod
@@ -920,6 +1105,7 @@ class ImageViewer:
         refine_kernel: int = 3,
         refine_kernel_w: int | None = None,
         refine_kernel_h: int | None = None,
+        refine_angle_enabled: bool = False,
         refine_open_iter: int = 1,
         refine_close_iter: int = 1,
         refine_min_area: int = 12,
@@ -1007,6 +1193,7 @@ class ImageViewer:
             refine_kernel=refine_kernel,
             refine_kernel_w=refine_kernel_w,
             refine_kernel_h=refine_kernel_h,
+            refine_angle_enabled=refine_angle_enabled,
             refine_open_iter=refine_open_iter,
             refine_close_iter=refine_close_iter,
             refine_min_area=refine_min_area,
@@ -1025,7 +1212,8 @@ class ImageViewer:
                 f"C{cluster_id}: {rate:.1f}%, RGB=({mean_rgb[0]:.0f},{mean_rgb[1]:.0f},{mean_rgb[2]:.0f})"
             )
         refine_text = (
-            f"refine={'on' if refine_enabled else 'off'}, kernel={refine_kernel}, kw={refine_kernel_w}, kh={refine_kernel_h}, "
+            f"refine={'on' if refine_enabled else 'off'}, angle={'on' if refine_angle_enabled else 'off'}, "
+            f"kernel={refine_kernel}, kw={refine_kernel_w}, kh={refine_kernel_h}, "
             f"open={refine_open_iter}, close={refine_close_iter}, min_area={refine_min_area}"
         )
         return clustered, refined, f"kmeans={kmeans_ms:.1f}ms | {refine_text} | color: {' | '.join(stats)} | {spatial_text}"

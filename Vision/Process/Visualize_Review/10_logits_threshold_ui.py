@@ -8,6 +8,9 @@ Expected CSV columns:
 
 Run:
     python Vision/Process/Visualize_Review/10_logits_threshold_ui.py --csv path/to/manifest.csv
+
+CSV open only loads metadata. Press Reload after setting Samples/group to preprocess a
+random sample from each group.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import random
 import sys
 import tkinter as tk
 from dataclasses import dataclass
@@ -346,6 +350,7 @@ class LogitsThresholdApp:
         self.root.title("Class-1 Jet Logits Threshold Explorer")
         self.root.geometry("1560x980")
         self.csv_path: Path | None = None
+        self.all_records: list[ImageRecord] = []
         self.records: list[ImageRecord] = []
         self.selected_group: str | None = None
         self.selected_record_index: int | None = None
@@ -356,6 +361,8 @@ class LogitsThresholdApp:
         self.threshold_var = tk.DoubleVar(value=0.50)
         self.threshold_text_var = tk.StringVar(value="0.500")
         self.min_pixels_var = tk.IntVar(value=1)
+        self.samples_per_group_var = tk.IntVar(value=20)
+        self.sample_seed_var = tk.IntVar(value=0)
         self.decode_mode_var = tk.StringVar(value="auto")
         self.show_all_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Open a manifest CSV.")
@@ -384,6 +391,28 @@ class LogitsThresholdApp:
         mode_combo.pack(side=tk.LEFT, padx=(0, 14))
         mode_combo.bind("<<ComboboxSelected>>", lambda _event: self.recompute_histograms())
 
+        ttk.Label(control, text="Samples/group").pack(side=tk.LEFT, padx=(0, 5))
+        samples_per_group = ttk.Spinbox(
+            control,
+            textvariable=self.samples_per_group_var,
+            from_=1,
+            to=100_000,
+            increment=1,
+            width=7,
+        )
+        samples_per_group.pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Label(control, text="Seed").pack(side=tk.LEFT, padx=(0, 5))
+        sample_seed = ttk.Spinbox(
+            control,
+            textvariable=self.sample_seed_var,
+            from_=0,
+            to=1_000_000,
+            increment=1,
+            width=7,
+        )
+        sample_seed.pack(side=tk.LEFT, padx=(0, 14))
+
         ttk.Label(control, text="Min pixels").pack(side=tk.LEFT, padx=(0, 5))
         min_pixels = ttk.Spinbox(
             control,
@@ -399,12 +428,12 @@ class LogitsThresholdApp:
 
         ttk.Checkbutton(
             control,
-            text="Show all rows",
+            text="Show all sampled",
             variable=self.show_all_var,
             command=self.refresh_image_list,
         ).pack(side=tk.LEFT, padx=(0, 14))
 
-        ttk.Button(control, text="Reload", command=self.reload_csv).pack(side=tk.LEFT)
+        ttk.Button(control, text="Reload", command=self.reload_sample).pack(side=tk.LEFT)
 
         threshold_frame = ttk.Frame(self.root, padding=(10, 0))
         threshold_frame.pack(side=tk.TOP, fill=tk.X)
@@ -434,9 +463,9 @@ class LogitsThresholdApp:
         group_frame = ttk.LabelFrame(body, text="Groups", padding=(6, 6))
         body.add(group_frame, weight=1)
 
-        group_columns = ("group", "alive", "total", "pct", "pixels")
+        group_columns = ("group", "alive", "sampled", "total", "pct", "pixels")
         self.group_tree = ttk.Treeview(group_frame, columns=group_columns, show="headings", height=22)
-        for column, width in zip(group_columns, (210, 70, 70, 70, 110)):
+        for column, width in zip(group_columns, (210, 70, 70, 70, 70, 110)):
             self.group_tree.heading(column, text=column)
             self.group_tree.column(column, width=width, minwidth=50, anchor="center")
         self.group_tree.column("group", anchor="w")
@@ -502,11 +531,11 @@ class LogitsThresholdApp:
         if path_text:
             self.load_csv(Path(path_text))
 
-    def reload_csv(self) -> None:
+    def reload_sample(self) -> None:
         if self.csv_path is None:
             self.ask_open_csv()
             return
-        self.load_csv(self.csv_path)
+        self.prepare_sample_and_decode()
 
     def load_csv(self, path: Path) -> None:
         try:
@@ -519,16 +548,79 @@ class LogitsThresholdApp:
             return
 
         self.csv_path = path
-        self.records = records
+        self.all_records = records
+        self.records = []
         self.selected_group = None
         self.selected_record_index = None
         self.csv_var.set(str(path))
-        self.status_var.set(f"Loaded {len(records)} rows with {csv_data.encoding}. Decoding heatmaps...")
+        self.populate_group_tree()
+
+        groups = sorted({record.group for record in self.all_records})
+        self.selected_group = groups[0] if groups else None
+        if self.selected_group is not None:
+            self.select_group(self.selected_group)
+
+        self.summary_var.set(f"source rows={len(records)}, groups={len(groups)}. Press Reload to preprocess samples.")
+        self.status_var.set(
+            f"Loaded {len(records)} rows with {csv_data.encoding}. "
+            "No heatmaps decoded yet; set Samples/group and press Reload."
+        )
+        self.show_blank_preview("Press Reload to preprocess sampled rows.")
+
+    def current_samples_per_group(self) -> int:
+        try:
+            return max(1, int(self.samples_per_group_var.get()))
+        except Exception:  # noqa: BLE001
+            return 20
+
+    def current_sample_seed(self) -> int:
+        try:
+            return int(self.sample_seed_var.get())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def source_group_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for record in self.all_records:
+            counts[record.group] = counts.get(record.group, 0) + 1
+        return counts
+
+    def prepare_sample_and_decode(self) -> None:
+        if not self.all_records:
+            self.status_var.set("No CSV rows loaded.")
+            return
+
+        sample_count = self.current_samples_per_group()
+        rng = random.Random(self.current_sample_seed())
+        by_group: dict[str, list[ImageRecord]] = {}
+        for record in self.all_records:
+            by_group.setdefault(record.group, []).append(record)
+
+        sampled: list[ImageRecord] = []
+        for group in sorted(by_group):
+            group_records = by_group[group]
+            if len(group_records) <= sample_count:
+                selected = list(group_records)
+            else:
+                selected = rng.sample(group_records, sample_count)
+                selected.sort(key=lambda record: (record.file_name, record.index))
+            sampled.extend(selected)
+
+        self.records = sampled
+        self.selected_record_index = None
+        self.populate_group_tree()
+        if self.selected_group not in by_group:
+            self.selected_group = sorted(by_group)[0]
+        self.status_var.set(
+            f"Sampled {len(self.records)}/{len(self.all_records)} rows "
+            f"({sample_count}/group, seed={self.current_sample_seed()}). Decoding heatmaps..."
+        )
         self.root.update_idletasks()
         self.recompute_histograms(show_errors=False)
 
     def recompute_histograms(self, show_errors: bool = True) -> None:
         if not self.records:
+            self.refresh_threshold_view()
             return
 
         load_score_map.cache_clear()
@@ -563,14 +655,18 @@ class LogitsThresholdApp:
                 self.status_var.set(f"Decoded {offset}/{total} heatmaps with mode={mode}...")
                 self.root.update_idletasks()
 
-        groups = sorted({record.group for record in self.records})
-        self.selected_group = groups[0] if groups else None
+        groups = sorted({record.group for record in self.all_records}) or sorted({record.group for record in self.records})
+        if self.selected_group not in groups:
+            self.selected_group = groups[0] if groups else None
         self.populate_group_tree()
         self.refresh_threshold_view()
         if self.selected_group is not None:
             self.select_group(self.selected_group)
 
-        message = f"Ready. rows={total}, groups={len(groups)}, decode_mode={mode}, errors={errors}"
+        message = (
+            f"Ready. sampled_rows={total}/{len(self.all_records) or total}, "
+            f"groups={len(groups)}, decode_mode={mode}, errors={errors}"
+        )
         self.status_var.set(message)
         if errors and show_errors:
             messagebox.showwarning("Heatmap decode warnings", f"{errors} rows could not be decoded. See image list.")
@@ -608,43 +704,61 @@ class LogitsThresholdApp:
             self.group_tree.delete(item)
         self.group_rows.clear()
 
-        for group in sorted({record.group for record in self.records}):
-            item_id = self.group_tree.insert("", tk.END, values=(group, 0, 0, "0.0%", 0))
+        source_counts = self.source_group_counts()
+        groups = sorted(source_counts) if source_counts else sorted({record.group for record in self.records})
+        for group in groups:
+            item_id = self.group_tree.insert(
+                "",
+                tk.END,
+                values=(group, 0, 0, source_counts.get(group, 0), "0.0%", 0),
+            )
             self.group_rows[group] = item_id
 
     def refresh_threshold_view(self) -> None:
         threshold_bin = self.current_threshold_bin()
         min_pixels = self.current_min_pixels()
         total_alive = 0
-        total_rows = 0
+        sampled_rows = 0
+        source_rows = len(self.all_records) if self.all_records else len(self.records)
         total_pixels = 0
 
-        group_stats: dict[str, dict[str, int]] = {}
+        source_counts = self.source_group_counts()
+        group_stats: dict[str, dict[str, int]] = {
+            group: {"alive": 0, "sampled": 0, "total": total, "pixels": 0}
+            for group, total in source_counts.items()
+        }
         for record in self.records:
-            stats = group_stats.setdefault(record.group, {"alive": 0, "total": 0, "pixels": 0})
-            stats["total"] += 1
+            stats = group_stats.setdefault(record.group, {"alive": 0, "sampled": 0, "total": 0, "pixels": 0})
+            stats["sampled"] += 1
             alive_pixels = record.alive_pixels(threshold_bin)
             stats["pixels"] += alive_pixels
             if alive_pixels >= min_pixels:
                 stats["alive"] += 1
-            total_rows += 1
+            sampled_rows += 1
             total_pixels += alive_pixels
 
         for group, stats in group_stats.items():
             item_id = self.group_rows.get(group)
             if item_id is None:
                 continue
-            pct = (stats["alive"] / stats["total"] * 100.0) if stats["total"] else 0.0
+            pct = (stats["alive"] / stats["sampled"] * 100.0) if stats["sampled"] else 0.0
             self.group_tree.item(
                 item_id,
-                values=(group, stats["alive"], stats["total"], f"{pct:.1f}%", stats["pixels"]),
+                values=(
+                    group,
+                    stats["alive"],
+                    stats["sampled"],
+                    stats["total"],
+                    f"{pct:.1f}%",
+                    stats["pixels"],
+                ),
             )
             total_alive += stats["alive"]
 
         threshold = self.threshold_var.get()
         self.summary_var.set(
             f"score>={threshold:.3f} (bin {threshold_bin}/255), "
-            f"alive images={total_alive}/{total_rows}, alive pixels={total_pixels}"
+            f"alive sampled images={total_alive}/{sampled_rows}, source rows={source_rows}, alive pixels={total_pixels}"
         )
         self.refresh_image_list()
         self.render_selected_record()
@@ -700,6 +814,8 @@ class LogitsThresholdApp:
             self.image_tree.selection_set(first_item)
             self.image_tree.focus(first_item)
             self.on_image_select(None)
+        elif not self.records:
+            self.show_blank_preview("Press Reload to preprocess sampled rows.")
         else:
             self.show_blank_preview(f"No rows survive in group: {self.selected_group}")
 

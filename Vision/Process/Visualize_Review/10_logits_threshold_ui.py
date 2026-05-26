@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Interactive threshold explorer for class-1 jet logits manifests.
+"""Interactive threshold explorer for class-1 raw logits manifests.
 
 Expected CSV columns:
-    group, file_name, original_path, logits_class0_path, logits_class1_path,
+    group, file_name, original_path,
+    logits_class0_raw_path, logits_class0_path, logits_class0_min,
+    logits_class0_max, logits_class0_mean, logits_class0_std,
+    logits_class1_raw_path, logits_class1_path, logits_class1_min,
+    logits_class1_max, logits_class1_mean, logits_class1_std,
     mask_path, overlap_class0_original_path, overlap_class0_overlap_path,
     overlap_class1_original_path, overlap_class1_overlap_path
 
@@ -39,8 +43,18 @@ REQUIRED_COLUMNS = (
     "group",
     "file_name",
     "original_path",
+    "logits_class0_raw_path",
     "logits_class0_path",
+    "logits_class0_min",
+    "logits_class0_max",
+    "logits_class0_mean",
+    "logits_class0_std",
+    "logits_class1_raw_path",
     "logits_class1_path",
+    "logits_class1_min",
+    "logits_class1_max",
+    "logits_class1_mean",
+    "logits_class1_std",
     "mask_path",
     "overlap_class0_original_path",
     "overlap_class0_overlap_path",
@@ -50,7 +64,9 @@ REQUIRED_COLUMNS = (
 
 PATH_COLUMNS = (
     "original_path",
+    "logits_class0_raw_path",
     "logits_class0_path",
+    "logits_class1_raw_path",
     "logits_class1_path",
     "mask_path",
     "overlap_class0_original_path",
@@ -62,6 +78,19 @@ PATH_COLUMNS = (
 ENCODINGS = ("utf-8-sig", "utf-8", "cp949", "euc-kr")
 PREVIEW_SIZE = 360
 MISSING = "<missing>"
+RAW_SHAPE = (640, 640)
+RAW_PIXEL_COUNT = RAW_SHAPE[0] * RAW_SHAPE[1]
+RAW_FLOAT32_BYTES = RAW_PIXEL_COUNT * 4
+STAT_COLUMNS = (
+    "logits_class0_min",
+    "logits_class0_max",
+    "logits_class0_mean",
+    "logits_class0_std",
+    "logits_class1_min",
+    "logits_class1_max",
+    "logits_class1_mean",
+    "logits_class1_std",
+)
 
 try:
     RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
@@ -84,28 +113,28 @@ class ImageRecord:
     group: str
     file_name: str
     paths: dict[str, Path | None]
-    hist: np.ndarray | None = None
-    survival: np.ndarray | None = None
-    max_bin: int = -1
+    stats: dict[str, float]
+    raw_values_sorted: np.ndarray | None = None
+    raw_min: float = float("nan")
+    raw_max: float = float("nan")
+    raw_mean: float = float("nan")
+    raw_std: float = float("nan")
+    pixel_count: int = 0
     load_error: str = ""
 
-    def alive_pixels(self, threshold_bin: int) -> int:
-        if self.survival is None or threshold_bin < 0:
+    def alive_pixels(self, threshold: float) -> int:
+        if self.raw_values_sorted is None or not np.isfinite(threshold):
             return 0
-        threshold_bin = min(max(threshold_bin, 0), 255)
-        return int(self.survival[threshold_bin])
+        index = int(np.searchsorted(self.raw_values_sorted, threshold, side="left"))
+        return int(len(self.raw_values_sorted) - index)
 
     @property
     def total_pixels(self) -> int:
-        if self.hist is None:
-            return 0
-        return int(self.hist.sum())
+        return int(self.pixel_count)
 
     @property
     def max_score(self) -> float:
-        if self.max_bin < 0:
-            return float("nan")
-        return self.max_bin / 255.0
+        return self.raw_max
 
 
 def read_csv_flexible(path: Path) -> CsvData:
@@ -164,6 +193,14 @@ def resolve_path(raw_value: str, csv_path: Path) -> Path | None:
     return candidates[0]
 
 
+def parse_float_value(value: object) -> float:
+    try:
+        number = float(str(value).strip())
+    except Exception:  # noqa: BLE001
+        return float("nan")
+    return number if np.isfinite(number) else float("nan")
+
+
 def build_records(csv_path: Path, rows: list[dict[str, str]]) -> list[ImageRecord]:
     records: list[ImageRecord] = []
     for index, row in enumerate(rows):
@@ -174,7 +211,8 @@ def build_records(csv_path: Path, rows: list[dict[str, str]]) -> list[ImageRecor
             file_name = Path(original).name if original else f"row_{index}"
 
         paths = {column: resolve_path(row.get(column, ""), csv_path) for column in PATH_COLUMNS}
-        records.append(ImageRecord(index=index, group=group, file_name=file_name, paths=paths))
+        stats = {column: parse_float_value(row.get(column, "")) for column in STAT_COLUMNS}
+        records.append(ImageRecord(index=index, group=group, file_name=file_name, paths=paths, stats=stats))
     return records
 
 
@@ -268,6 +306,22 @@ def load_score_map(path_text: str, mode: str) -> np.ndarray:
     return decode_rgb_to_score_bins(rgb, mode)
 
 
+@lru_cache(maxsize=8)
+def load_raw_logits(path_text: str) -> np.ndarray:
+    path = Path(path_text)
+    file_size = path.stat().st_size
+    if file_size != RAW_FLOAT32_BYTES:
+        raise ValueError(
+            f"Unexpected raw file size: {file_size:,} bytes "
+            f"(expected {RAW_FLOAT32_BYTES:,} bytes for 640x640 float32)."
+        )
+
+    values = np.fromfile(path, dtype="<f4", count=RAW_PIXEL_COUNT)
+    if values.size != RAW_PIXEL_COUNT:
+        raise ValueError(f"Unexpected raw value count: {values.size:,} (expected {RAW_PIXEL_COUNT:,}).")
+    return values.reshape(RAW_SHAPE)
+
+
 def histogram_from_score_map(score_map: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
     hist = np.bincount(score_map.ravel(), minlength=256).astype(np.int64)
     survival = np.cumsum(hist[::-1], dtype=np.int64)[::-1]
@@ -284,7 +338,7 @@ def threshold_to_bin(threshold: float) -> int:
 def score_text(score: float) -> str:
     if not np.isfinite(score):
         return "nan"
-    return f"{score:.3f}"
+    return f"{score:.6g}"
 
 
 def fit_image(image: Image.Image, size: int = PREVIEW_SIZE) -> Image.Image:
@@ -344,10 +398,49 @@ def make_overlay_image(original: Image.Image, score_map: np.ndarray, threshold_b
     return Image.alpha_composite(base, overlay_image).convert("RGB")
 
 
+def normalize_raw_to_uint8(raw_map: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
+    finite_mask = np.isfinite(raw_map)
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        finite_values = raw_map[finite_mask]
+        if finite_values.size == 0:
+            return np.zeros(raw_map.shape, dtype=np.uint8)
+        vmin = float(finite_values.min())
+        vmax = float(finite_values.max())
+    if vmax <= vmin:
+        return np.zeros(raw_map.shape, dtype=np.uint8)
+
+    scaled = (raw_map.astype(np.float32) - np.float32(vmin)) / np.float32(vmax - vmin)
+    scaled = np.where(finite_mask, scaled, 0.0)
+    return np.clip(np.rint(scaled * 255.0), 0, 255).astype(np.uint8)
+
+
+def make_raw_heatmap_image(raw_map: np.ndarray, vmin: float, vmax: float) -> Image.Image:
+    bins = normalize_raw_to_uint8(raw_map, vmin, vmax)
+    rgb = matplotlib_jet_lut()[bins]
+    return Image.fromarray(rgb, mode="RGB")
+
+
+def make_raw_mask_image(raw_map: np.ndarray, threshold: float) -> Image.Image:
+    mask = (np.isfinite(raw_map) & (raw_map >= threshold)).astype(np.uint8) * 255
+    return Image.fromarray(mask, mode="L").convert("RGB")
+
+
+def make_raw_overlay_image(original: Image.Image, raw_map: np.ndarray, threshold: float) -> Image.Image:
+    base = original.convert("RGBA")
+    mask = np.isfinite(raw_map) & (raw_map >= threshold)
+    overlay = np.zeros((raw_map.shape[0], raw_map.shape[1], 4), dtype=np.uint8)
+    overlay[..., 0] = 255
+    overlay[..., 3] = np.where(mask, 140, 0).astype(np.uint8)
+    overlay_image = Image.fromarray(overlay, mode="RGBA")
+    if overlay_image.size != base.size:
+        overlay_image = overlay_image.resize(base.size, RESAMPLE_NEAREST)
+    return Image.alpha_composite(base, overlay_image).convert("RGB")
+
+
 class LogitsThresholdApp:
     def __init__(self, root: tk.Tk, csv_path: Path | None = None) -> None:
         self.root = root
-        self.root.title("Class-1 Jet Logits Threshold Explorer")
+        self.root.title("Class-1 Raw Logits Threshold Explorer")
         self.root.geometry("1560x980")
         self.csv_path: Path | None = None
         self.all_records: list[ImageRecord] = []
@@ -360,10 +453,11 @@ class LogitsThresholdApp:
 
         self.threshold_var = tk.DoubleVar(value=0.50)
         self.threshold_text_var = tk.StringVar(value="0.500")
+        self.threshold_min = 0.0
+        self.threshold_max = 1.0
         self.min_pixels_var = tk.IntVar(value=1)
         self.samples_per_group_var = tk.IntVar(value=20)
         self.sample_seed_var = tk.IntVar(value=0)
-        self.decode_mode_var = tk.StringVar(value="auto")
         self.show_all_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Open a manifest CSV.")
         self.csv_var = tk.StringVar(value="")
@@ -379,17 +473,6 @@ class LogitsThresholdApp:
 
         ttk.Button(control, text="Open CSV", command=self.ask_open_csv).pack(side=tk.LEFT)
         ttk.Label(control, textvariable=self.csv_var, width=72, anchor="w").pack(side=tk.LEFT, padx=(8, 18))
-
-        ttk.Label(control, text="Decode").pack(side=tk.LEFT, padx=(0, 5))
-        mode_combo = ttk.Combobox(
-            control,
-            textvariable=self.decode_mode_var,
-            width=15,
-            state="readonly",
-            values=("auto", "matplotlib_jet", "opencv_jet", "luminance"),
-        )
-        mode_combo.pack(side=tk.LEFT, padx=(0, 14))
-        mode_combo.bind("<<ComboboxSelected>>", lambda _event: self.recompute_histograms())
 
         ttk.Label(control, text="Samples/group").pack(side=tk.LEFT, padx=(0, 5))
         samples_per_group = ttk.Spinbox(
@@ -439,7 +522,7 @@ class LogitsThresholdApp:
         threshold_frame.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Label(threshold_frame, text="Threshold").pack(side=tk.LEFT, padx=(0, 8))
-        scale = tk.Scale(
+        self.threshold_scale = tk.Scale(
             threshold_frame,
             from_=0.0,
             to=1.0,
@@ -450,8 +533,8 @@ class LogitsThresholdApp:
             command=self.on_threshold_slider,
             showvalue=False,
         )
-        scale.pack(side=tk.LEFT)
-        threshold_entry = ttk.Entry(threshold_frame, textvariable=self.threshold_text_var, width=8)
+        self.threshold_scale.pack(side=tk.LEFT)
+        threshold_entry = ttk.Entry(threshold_frame, textvariable=self.threshold_text_var, width=12)
         threshold_entry.pack(side=tk.LEFT, padx=(8, 18))
         threshold_entry.bind("<Return>", lambda _event: self.on_threshold_entry())
         threshold_entry.bind("<FocusOut>", lambda _event: self.on_threshold_entry())
@@ -478,9 +561,9 @@ class LogitsThresholdApp:
         list_frame = ttk.LabelFrame(body, text="Images", padding=(6, 6))
         body.add(list_frame, weight=2)
 
-        image_columns = ("file_name", "max", "pixels", "ratio", "error")
+        image_columns = ("file_name", "min", "max", "pixels", "ratio", "error")
         self.image_tree = ttk.Treeview(list_frame, columns=image_columns, show="headings", height=22)
-        for column, width in zip(image_columns, (260, 70, 90, 70, 170)):
+        for column, width in zip(image_columns, (240, 70, 70, 90, 70, 170)):
             self.image_tree.heading(column, text=column)
             self.image_tree.column(column, width=width, minwidth=50, anchor="center")
         self.image_tree.column("file_name", anchor="w")
@@ -502,7 +585,7 @@ class LogitsThresholdApp:
         self.panel_labels: dict[str, ttk.Label] = {}
         panels = (
             ("original", "Original"),
-            ("logits", "Class1 jet"),
+            ("logits", "Class1 raw"),
             ("mask", "Threshold mask"),
             ("overlay", "Original + mask"),
         )
@@ -557,15 +640,55 @@ class LogitsThresholdApp:
 
         groups = sorted({record.group for record in self.all_records})
         self.selected_group = groups[0] if groups else None
+        self.set_threshold_range_from_records(self.all_records, use_loaded_stats=False)
         if self.selected_group is not None:
             self.select_group(self.selected_group)
 
         self.summary_var.set(f"source rows={len(records)}, groups={len(groups)}. Press Reload to preprocess samples.")
         self.status_var.set(
             f"Loaded {len(records)} rows with {csv_data.encoding}. "
-            "No heatmaps decoded yet; set Samples/group and press Reload."
+            "No raw logits loaded yet; set Samples/group and press Reload."
         )
         self.show_blank_preview("Press Reload to preprocess sampled rows.")
+
+    def format_threshold(self, value: float) -> str:
+        return score_text(value)
+
+    def set_threshold_range(self, vmin: float, vmax: float) -> None:
+        if not np.isfinite(vmin) or not np.isfinite(vmax):
+            vmin, vmax = 0.0, 1.0
+        if vmax < vmin:
+            vmin, vmax = vmax, vmin
+        if vmax == vmin:
+            pad = max(abs(vmin) * 0.05, 1.0)
+            vmin -= pad
+            vmax += pad
+
+        self.threshold_min = float(vmin)
+        self.threshold_max = float(vmax)
+        resolution = max((self.threshold_max - self.threshold_min) / 1000.0, 1e-9)
+        self.threshold_scale.configure(from_=self.threshold_min, to=self.threshold_max, resolution=resolution)
+
+        threshold = self.threshold_var.get()
+        if not np.isfinite(threshold) or threshold < self.threshold_min or threshold > self.threshold_max:
+            threshold = (self.threshold_min + self.threshold_max) / 2.0
+            self.threshold_var.set(threshold)
+        self.threshold_text_var.set(self.format_threshold(threshold))
+
+    def set_threshold_range_from_records(self, records: list[ImageRecord], use_loaded_stats: bool) -> None:
+        mins: list[float] = []
+        maxes: list[float] = []
+        for record in records:
+            min_value = record.raw_min if use_loaded_stats else record.stats.get("logits_class1_min", float("nan"))
+            max_value = record.raw_max if use_loaded_stats else record.stats.get("logits_class1_max", float("nan"))
+            if np.isfinite(min_value):
+                mins.append(float(min_value))
+            if np.isfinite(max_value):
+                maxes.append(float(max_value))
+        if mins and maxes:
+            self.set_threshold_range(min(mins), max(maxes))
+        else:
+            self.set_threshold_range(0.0, 1.0)
 
     def current_samples_per_group(self) -> int:
         try:
@@ -613,7 +736,7 @@ class LogitsThresholdApp:
             self.selected_group = sorted(by_group)[0]
         self.status_var.set(
             f"Sampled {len(self.records)}/{len(self.all_records)} rows "
-            f"({sample_count}/group, seed={self.current_sample_seed()}). Decoding heatmaps..."
+            f"({sample_count}/group, seed={self.current_sample_seed()}). Loading raw logits..."
         )
         self.root.update_idletasks()
         self.recompute_histograms(show_errors=False)
@@ -623,41 +746,54 @@ class LogitsThresholdApp:
             self.refresh_threshold_view()
             return
 
-        load_score_map.cache_clear()
+        load_raw_logits.cache_clear()
         load_rgb_image.cache_clear()
-        mode = self.decode_mode_var.get()
         total = len(self.records)
         errors = 0
 
         for offset, record in enumerate(self.records, start=1):
-            record.hist = None
-            record.survival = None
-            record.max_bin = -1
+            record.raw_values_sorted = None
+            record.raw_min = float("nan")
+            record.raw_max = float("nan")
+            record.raw_mean = float("nan")
+            record.raw_std = float("nan")
+            record.pixel_count = 0
             record.load_error = ""
-            logits_path = record.paths.get("logits_class1_path")
-            if logits_path is None:
-                record.load_error = "empty logits path"
+            raw_path = record.paths.get("logits_class1_raw_path")
+            if raw_path is None:
+                record.load_error = "empty raw logits path"
                 errors += 1
                 continue
-            if not logits_path.exists():
-                record.load_error = "missing logits file"
+            if not raw_path.exists():
+                record.load_error = "missing raw logits file"
                 errors += 1
                 continue
 
             try:
-                score_map = load_score_map(str(logits_path), mode)
-                record.hist, record.survival, record.max_bin = histogram_from_score_map(score_map)
+                raw_map = load_raw_logits(str(raw_path))
+                finite_values = raw_map[np.isfinite(raw_map)]
+                record.pixel_count = int(raw_map.size)
+                if finite_values.size:
+                    record.raw_values_sorted = np.sort(finite_values.astype(np.float32, copy=True))
+                    record.raw_min = float(finite_values.min())
+                    record.raw_max = float(finite_values.max())
+                    record.raw_mean = float(finite_values.mean(dtype=np.float64))
+                    record.raw_std = float(finite_values.std(dtype=np.float64))
+                else:
+                    record.load_error = "raw logits contain no finite values"
+                    errors += 1
             except Exception as exc:  # noqa: BLE001 - row-level error should not kill the app
                 record.load_error = str(exc)
                 errors += 1
 
             if offset == 1 or offset == total or offset % 25 == 0:
-                self.status_var.set(f"Decoded {offset}/{total} heatmaps with mode={mode}...")
+                self.status_var.set(f"Loaded {offset}/{total} raw class-1 logits...")
                 self.root.update_idletasks()
 
         groups = sorted({record.group for record in self.all_records}) or sorted({record.group for record in self.records})
         if self.selected_group not in groups:
             self.selected_group = groups[0] if groups else None
+        self.set_threshold_range_from_records(self.records, use_loaded_stats=True)
         self.populate_group_tree()
         self.refresh_threshold_view()
         if self.selected_group is not None:
@@ -665,30 +801,30 @@ class LogitsThresholdApp:
 
         message = (
             f"Ready. sampled_rows={total}/{len(self.all_records) or total}, "
-            f"groups={len(groups)}, decode_mode={mode}, errors={errors}"
+            f"groups={len(groups)}, raw_errors={errors}"
         )
         self.status_var.set(message)
         if errors and show_errors:
-            messagebox.showwarning("Heatmap decode warnings", f"{errors} rows could not be decoded. See image list.")
+            messagebox.showwarning("Raw logits load warnings", f"{errors} rows could not be loaded. See image list.")
 
     def on_threshold_slider(self, raw_value: str) -> None:
         threshold = float(raw_value)
-        self.threshold_text_var.set(f"{threshold:.3f}")
+        self.threshold_text_var.set(self.format_threshold(threshold))
         self.refresh_threshold_view()
 
     def on_threshold_entry(self) -> None:
         try:
             threshold = float(self.threshold_text_var.get())
         except ValueError:
-            self.threshold_text_var.set(f"{self.threshold_var.get():.3f}")
+            self.threshold_text_var.set(self.format_threshold(self.threshold_var.get()))
             return
-        threshold = min(max(threshold, 0.0), 1.0)
+        threshold = min(max(threshold, self.threshold_min), self.threshold_max)
         self.threshold_var.set(threshold)
-        self.threshold_text_var.set(f"{threshold:.3f}")
+        self.threshold_text_var.set(self.format_threshold(threshold))
         self.refresh_threshold_view()
 
-    def current_threshold_bin(self) -> int:
-        return threshold_to_bin(self.threshold_var.get())
+    def current_threshold(self) -> float:
+        return float(self.threshold_var.get())
 
     def current_min_pixels(self) -> int:
         try:
@@ -696,8 +832,8 @@ class LogitsThresholdApp:
         except Exception:  # noqa: BLE001
             return 1
 
-    def record_survives(self, record: ImageRecord, threshold_bin: int, min_pixels: int) -> bool:
-        return record.alive_pixels(threshold_bin) >= min_pixels
+    def record_survives(self, record: ImageRecord, threshold: float, min_pixels: int) -> bool:
+        return record.alive_pixels(threshold) >= min_pixels
 
     def populate_group_tree(self) -> None:
         for item in self.group_tree.get_children():
@@ -715,7 +851,7 @@ class LogitsThresholdApp:
             self.group_rows[group] = item_id
 
     def refresh_threshold_view(self) -> None:
-        threshold_bin = self.current_threshold_bin()
+        threshold = self.current_threshold()
         min_pixels = self.current_min_pixels()
         total_alive = 0
         sampled_rows = 0
@@ -730,7 +866,7 @@ class LogitsThresholdApp:
         for record in self.records:
             stats = group_stats.setdefault(record.group, {"alive": 0, "sampled": 0, "total": 0, "pixels": 0})
             stats["sampled"] += 1
-            alive_pixels = record.alive_pixels(threshold_bin)
+            alive_pixels = record.alive_pixels(threshold)
             stats["pixels"] += alive_pixels
             if alive_pixels >= min_pixels:
                 stats["alive"] += 1
@@ -755,9 +891,8 @@ class LogitsThresholdApp:
             )
             total_alive += stats["alive"]
 
-        threshold = self.threshold_var.get()
         self.summary_var.set(
-            f"score>={threshold:.3f} (bin {threshold_bin}/255), "
+            f"raw>={self.format_threshold(threshold)}, "
             f"alive sampled images={total_alive}/{sampled_rows}, source rows={source_rows}, alive pixels={total_pixels}"
         )
         self.refresh_image_list()
@@ -771,22 +906,23 @@ class LogitsThresholdApp:
         if self.selected_group is None:
             return
 
-        threshold_bin = self.current_threshold_bin()
+        threshold = self.current_threshold()
         min_pixels = self.current_min_pixels()
         show_all = self.show_all_var.get()
         records = [record for record in self.records if record.group == self.selected_group]
         rows: list[tuple[int, ImageRecord, int]] = []
 
         for record in records:
-            alive_pixels = record.alive_pixels(threshold_bin)
+            alive_pixels = record.alive_pixels(threshold)
             if show_all or alive_pixels >= min_pixels:
                 rows.append((alive_pixels, record, record.total_pixels))
 
-        rows.sort(key=lambda item: (item[0], item[1].max_bin, item[1].file_name), reverse=True)
+        rows.sort(key=lambda item: (item[0], item[1].max_score, item[1].file_name), reverse=True)
         for alive_pixels, record, total_pixels in rows:
             ratio = alive_pixels / total_pixels * 100.0 if total_pixels else 0.0
             values = (
                 record.file_name,
+                score_text(record.raw_min),
                 score_text(record.max_score),
                 alive_pixels,
                 f"{ratio:.2f}%",
@@ -860,46 +996,54 @@ class LogitsThresholdApp:
             self.show_blank_preview()
             return
 
-        threshold_bin = self.current_threshold_bin()
-        alive_pixels = record.alive_pixels(threshold_bin)
+        threshold = self.current_threshold()
+        alive_pixels = record.alive_pixels(threshold)
         total_pixels = record.total_pixels
         ratio = alive_pixels / total_pixels * 100.0 if total_pixels else 0.0
-        logits_path = record.paths.get("logits_class1_path")
+        raw_path = record.paths.get("logits_class1_raw_path")
         original_path = record.paths.get("original_path")
 
         self.meta_label.configure(
             text=(
                 f"group={record.group}\n"
                 f"file={record.file_name}\n"
-                f"max={score_text(record.max_score)}, alive_pixels={alive_pixels}/{total_pixels} ({ratio:.2f}%), "
-                f"threshold={self.threshold_var.get():.3f}, min_pixels={self.current_min_pixels()}"
+                f"loaded min/max/mean/std={score_text(record.raw_min)} / {score_text(record.raw_max)} / "
+                f"{score_text(record.raw_mean)} / {score_text(record.raw_std)}\n"
+                f"csv min/max/mean/std={score_text(record.stats.get('logits_class1_min', float('nan')))} / "
+                f"{score_text(record.stats.get('logits_class1_max', float('nan')))} / "
+                f"{score_text(record.stats.get('logits_class1_mean', float('nan')))} / "
+                f"{score_text(record.stats.get('logits_class1_std', float('nan')))}\n"
+                f"alive_pixels={alive_pixels}/{total_pixels} ({ratio:.2f}%), "
+                f"threshold={self.format_threshold(threshold)}, min_pixels={self.current_min_pixels()}"
             )
         )
 
         original_image = self.safe_load_image(original_path, "Original")
-        logits_image = self.safe_load_image(logits_path, "Class1 jet")
+        raw_heatmap = None
 
-        score_map: np.ndarray | None = None
-        if logits_path is not None and logits_path.exists():
+        raw_map: np.ndarray | None = None
+        if raw_path is not None and raw_path.exists():
             try:
-                score_map = load_score_map(str(logits_path), self.decode_mode_var.get())
+                raw_map = load_raw_logits(str(raw_path))
             except Exception as exc:  # noqa: BLE001
-                score_map = None
-                self.status_var.set(f"Preview decode failed: {exc}")
+                raw_map = None
+                self.status_var.set(f"Preview raw load failed: {exc}")
 
-        if score_map is None:
-            mask_image = placeholder_image("No score map", record.load_error)
+        if raw_map is None:
+            raw_heatmap = placeholder_image("No raw map", record.load_error)
+            mask_image = placeholder_image("No raw map", record.load_error)
             overlay_image = placeholder_image("No overlay", record.load_error)
         else:
-            mask_image = make_mask_image(score_map, threshold_bin)
-            overlay_base = original_image if original_image is not None else logits_image
+            raw_heatmap = make_raw_heatmap_image(raw_map, self.threshold_min, self.threshold_max)
+            mask_image = make_raw_mask_image(raw_map, threshold)
+            overlay_base = original_image if original_image is not None else raw_heatmap
             if overlay_base is None:
                 overlay_image = placeholder_image("No overlay base")
             else:
-                overlay_image = make_overlay_image(overlay_base, score_map, threshold_bin)
+                overlay_image = make_raw_overlay_image(overlay_base, raw_map, threshold)
 
         self.set_panel_image("original", original_image or placeholder_image("Original unavailable"))
-        self.set_panel_image("logits", logits_image or placeholder_image("Class1 jet unavailable"))
+        self.set_panel_image("logits", raw_heatmap or placeholder_image("Class1 raw unavailable"))
         self.set_panel_image("mask", mask_image)
         self.set_panel_image("overlay", overlay_image)
 
@@ -926,7 +1070,7 @@ class LogitsThresholdApp:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Explore class-1 jet logits thresholds by group.")
+    parser = argparse.ArgumentParser(description="Explore class-1 raw logits thresholds by group.")
     parser.add_argument("--csv", type=Path, default=None, help="Manifest CSV path.")
     return parser.parse_args(argv)
 

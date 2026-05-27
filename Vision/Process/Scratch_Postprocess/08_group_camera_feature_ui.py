@@ -1718,6 +1718,8 @@ class GroupCameraFeatureExplorer:
         self.custom_terms: list[dict[str, object]] = []
         self.custom_metric_counter = 1
         self.artist_rows: dict[object, list[int]] = {}
+        self.main_jbf_results: dict[int, dict[str, object]] = {}
+        self.main_jbf_cache: dict[tuple[object, ...], dict[str, object]] = {}
         self.image_viewer = ImageViewer(root)
 
         self.csv_path_var = tk.StringVar(value=str(csv_path) if csv_path else "")
@@ -1733,6 +1735,16 @@ class GroupCameraFeatureExplorer:
         self.formula_text_var = tk.StringVar(value="항을 추가하세요.")
         self.threshold_var = tk.StringVar()
         self.threshold_direction_var = tk.StringVar(value="상단 제거 (>=)")
+        self.main_jbf_enable_var = tk.BooleanVar(value=False)
+        self.main_jbf_diameter_var = tk.IntVar(value=15)
+        self.main_jbf_sigma_color_var = tk.DoubleVar(value=30.0)
+        self.main_jbf_sigma_space_var = tk.DoubleVar(value=15.0)
+        self.main_jbf_morph_open_var = tk.IntVar(value=3)
+        self.main_jbf_morph_close_var = tk.IntVar(value=5)
+        self.main_jbf_blur_kernel_var = tk.IntVar(value=3)
+        self.main_jbf_threshold_var = tk.DoubleVar(value=230.0)
+        self.main_jbf_sample_size_var = tk.StringVar(value="500")
+        self.main_jbf_seed_var = tk.StringVar(value="17")
         self.status_var = tk.StringVar(value="CSV를 로드하세요.")
 
         self._build_layout()
@@ -1848,6 +1860,97 @@ class GroupCameraFeatureExplorer:
         self.term_listbox.pack(side=tk.LEFT, fill=tk.X, expand=False, padx=(0, 8))
         ttk.Label(formula_bottom, textvariable=self.formula_text_var, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        main_jbf_frame = ttk.LabelFrame(self.root, text="메인 JBF 배치 평가", padding=(8, 6))
+        main_jbf_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+        main_jbf_top = ttk.Frame(main_jbf_frame)
+        main_jbf_top.pack(side=tk.TOP, fill=tk.X)
+        main_jbf_bottom = ttk.Frame(main_jbf_frame)
+        main_jbf_bottom.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+
+        ttk.Checkbutton(
+            main_jbf_top,
+            text="JBFFilter 표시",
+            variable=self.main_jbf_enable_var,
+            command=self.refresh_plot,
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(main_jbf_top, text="JBF 적용/갱신", command=self.apply_main_jbf_batch).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(main_jbf_top, text="Sample rows(0=all)").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Entry(main_jbf_top, textvariable=self.main_jbf_sample_size_var, width=8).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(main_jbf_top, text="Seed").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Entry(main_jbf_top, textvariable=self.main_jbf_seed_var, width=8).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Label(main_jbf_top, text="현재 Group/Camera 필터 대상에서 샘플링 후 Alive/Dead 평가").pack(side=tk.LEFT)
+
+        ttk.Label(main_jbf_bottom, text="Diameter").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Scale(
+            main_jbf_bottom,
+            from_=1,
+            to=31,
+            resolution=2,
+            orient=tk.HORIZONTAL,
+            variable=self.main_jbf_diameter_var,
+            length=105,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(main_jbf_bottom, text="SigmaColor").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Scale(
+            main_jbf_bottom,
+            from_=1.0,
+            to=150.0,
+            resolution=1.0,
+            orient=tk.HORIZONTAL,
+            variable=self.main_jbf_sigma_color_var,
+            length=115,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(main_jbf_bottom, text="SigmaSpace").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Scale(
+            main_jbf_bottom,
+            from_=1.0,
+            to=50.0,
+            resolution=1.0,
+            orient=tk.HORIZONTAL,
+            variable=self.main_jbf_sigma_space_var,
+            length=110,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(main_jbf_bottom, text="MorphOpen").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Scale(
+            main_jbf_bottom,
+            from_=0,
+            to=5,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            variable=self.main_jbf_morph_open_var,
+            length=80,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(main_jbf_bottom, text="MorphClose").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Scale(
+            main_jbf_bottom,
+            from_=0,
+            to=5,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            variable=self.main_jbf_morph_close_var,
+            length=80,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(main_jbf_bottom, text="BlurKernel").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Scale(
+            main_jbf_bottom,
+            from_=1,
+            to=31,
+            resolution=2,
+            orient=tk.HORIZONTAL,
+            variable=self.main_jbf_blur_kernel_var,
+            length=95,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(main_jbf_bottom, text="Threshold(0-255)").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Scale(
+            main_jbf_bottom,
+            from_=0.0,
+            to=255.0,
+            resolution=1.0,
+            orient=tk.HORIZONTAL,
+            variable=self.main_jbf_threshold_var,
+            length=115,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
         main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
@@ -1879,6 +1982,11 @@ class GroupCameraFeatureExplorer:
             "true_defect_count",
             "micro_count",
             "other_count",
+            "jbf_eval",
+            "jbf_alive",
+            "jbf_dead",
+            "jbf_unknown",
+            "jbf_alive_rate",
         ]
         self.summary_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=22)
         for col in columns:
@@ -1935,6 +2043,8 @@ class GroupCameraFeatureExplorer:
             self.image_root = Path(selected)
             self.image_root_var.set(str(self.image_root))
             self.image_search_cache.clear()
+            self.main_jbf_results.clear()
+            self.main_jbf_cache.clear()
             self.status_var.set(f"이미지 루트 설정: {self.image_root}")
 
     def add_formula_term(self) -> None:
@@ -2078,6 +2188,8 @@ class GroupCameraFeatureExplorer:
         self.csv_path = path
         self.csv_dir = path.parent
         self.csv_path_var.set(str(path))
+        self.main_jbf_results.clear()
+        self.main_jbf_cache.clear()
         self.df = self._prepare_dataframe(df)
         self.numeric_features = self._numeric_feature_columns(self.df)
         self.custom_terms.clear()
@@ -2204,6 +2316,159 @@ class GroupCameraFeatureExplorer:
             return numeric <= threshold
         return numeric >= threshold
 
+    @staticmethod
+    def parse_int_text(raw: str, default: int = 0, minimum: int = 0) -> int:
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            return default
+        return max(value, minimum)
+
+    def main_jbf_params_tuple(self) -> tuple[object, ...]:
+        return (
+            int(self.main_jbf_diameter_var.get()),
+            round(float(self.main_jbf_sigma_color_var.get()), 4),
+            round(float(self.main_jbf_sigma_space_var.get()), 4),
+            int(self.main_jbf_morph_open_var.get()),
+            int(self.main_jbf_morph_close_var.get()),
+            int(self.main_jbf_blur_kernel_var.get()),
+            round(float(self.main_jbf_threshold_var.get()), 4),
+        )
+
+    def main_jbf_params_dict(self) -> dict[str, object]:
+        return {
+            "diameter": int(self.main_jbf_diameter_var.get()),
+            "sigma_color": float(self.main_jbf_sigma_color_var.get()),
+            "sigma_space": float(self.main_jbf_sigma_space_var.get()),
+            "morph_open": int(self.main_jbf_morph_open_var.get()),
+            "morph_close": int(self.main_jbf_morph_close_var.get()),
+            "blur_kernel": int(self.main_jbf_blur_kernel_var.get()),
+            "threshold": float(self.main_jbf_threshold_var.get()),
+        }
+
+    def evaluate_main_jbf_row(self, row: pd.Series, params: dict[str, object], params_key: tuple[object, ...]) -> dict[str, object]:
+        row_id = int(row.get("row_id"))
+        image_path = self.resolve_image_path(row.get("image_path")) if "image_path" in row.index else None
+        if image_path is None and "mask_raw_path" in row.index:
+            image_path = self.resolve_image_path(row.get("mask_raw_path"))
+        mask_path = self.resolve_image_path(row.get("mask_path")) if "mask_path" in row.index else None
+        cache_key = (row_id, str(image_path), str(mask_path), params_key)
+        if cache_key in self.main_jbf_cache:
+            return self.main_jbf_cache[cache_key].copy()
+
+        if image_path is None or mask_path is None:
+            result = {"status": "unknown", "raw_area": 0, "alive_area": 0, "elapsed_ms": 0.0, "mode": "missing_path"}
+            self.main_jbf_cache[cache_key] = result
+            return result.copy()
+
+        try:
+            guide = ImageViewer.load_rgb_array(image_path)
+            if guide is None:
+                raise FileNotFoundError(str(image_path))
+            mask = ImageViewer.load_mask_array(mask_path, guide.shape[:2])
+            if mask is None:
+                raise FileNotFoundError(str(mask_path))
+            raw_area = int(mask.sum())
+            if raw_area <= 0:
+                result = {"status": "dead", "raw_area": 0, "alive_area": 0, "elapsed_ms": 0.0, "mode": "empty_mask"}
+            else:
+                refined_mask, elapsed_ms, mode = ImageViewer.jbf_refine_mask(
+                    mask,
+                    guide_array=guide,
+                    valid_mask=mask,
+                    diameter=int(params["diameter"]),
+                    sigma_color=float(params["sigma_color"]),
+                    sigma_space=float(params["sigma_space"]),
+                    morph_open=int(params["morph_open"]),
+                    morph_close=int(params["morph_close"]),
+                    blur_kernel=int(params["blur_kernel"]),
+                    threshold=float(params["threshold"]),
+                )
+                alive_area = int(refined_mask.sum())
+                result = {
+                    "status": "alive" if alive_area > 0 else "dead",
+                    "raw_area": raw_area,
+                    "alive_area": alive_area,
+                    "elapsed_ms": float(elapsed_ms),
+                    "mode": mode,
+                }
+        except Exception as exc:  # noqa: BLE001 - batch evaluation should continue per row
+            result = {"status": "unknown", "raw_area": 0, "alive_area": 0, "elapsed_ms": 0.0, "mode": f"error:{type(exc).__name__}"}
+
+        self.main_jbf_cache[cache_key] = result
+        return result.copy()
+
+    def apply_main_jbf_batch(self) -> None:
+        if self.df.empty:
+            messagebox.showwarning("CSV 필요", "먼저 CSV를 로드하세요.")
+            return
+        if "mask_path" not in self.df.columns:
+            messagebox.showwarning("mask_path 필요", "CSV에 mask_path 컬럼이 필요합니다.")
+            return
+
+        work = self.filtered().copy()
+        if work.empty:
+            self.status_var.set("JBF 평가 대상 row가 없습니다.")
+            return
+
+        candidate_count = len(work)
+        sample_size = self.parse_int_text(self.main_jbf_sample_size_var.get(), default=500, minimum=0)
+        seed = self.parse_int_text(self.main_jbf_seed_var.get(), default=17, minimum=0)
+        if sample_size > 0 and len(work) > sample_size:
+            work = work.sample(n=sample_size, random_state=seed)
+            sampled_text = f"sampled={sample_size}/{candidate_count}, seed={seed}"
+        else:
+            sampled_text = f"sampled=all({len(work)}), seed={seed}"
+
+        params_key = self.main_jbf_params_tuple()
+        params = self.main_jbf_params_dict()
+        self.main_jbf_results.clear()
+        start = time.perf_counter()
+        total = len(work)
+        for index, (_idx, row) in enumerate(work.iterrows(), start=1):
+            row_id = int(row.get("row_id"))
+            self.main_jbf_results[row_id] = self.evaluate_main_jbf_row(row, params, params_key)
+            if index == 1 or index % 10 == 0 or index == total:
+                self.status_var.set(f"JBF 평가 중 {index}/{total} | {sampled_text}")
+                self.root.update_idletasks()
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        statuses = pd.Series([str(result.get("status", "unknown")) for result in self.main_jbf_results.values()])
+        alive = int((statuses == "alive").sum())
+        dead = int((statuses == "dead").sum())
+        unknown = int((statuses == "unknown").sum())
+        self.main_jbf_enable_var.set(True)
+        self.refresh_plot()
+        self.status_var.set(
+            f"JBF 평가 완료 | {sampled_text} | alive={alive}, dead={dead}, unknown={unknown}, elapsed={elapsed_ms:.1f}ms"
+        )
+
+    def attach_main_jbf_results(self, plot_df: pd.DataFrame) -> pd.DataFrame:
+        if plot_df.empty or not self.main_jbf_enable_var.get():
+            return plot_df
+        out = plot_df.copy()
+        statuses = []
+        raw_areas = []
+        alive_areas = []
+        modes = []
+        for row_id in out["row_id"].astype(int):
+            result = self.main_jbf_results.get(int(row_id))
+            if result is None:
+                statuses.append("unknown")
+                raw_areas.append(np.nan)
+                alive_areas.append(np.nan)
+                modes.append("")
+            else:
+                statuses.append(str(result.get("status", "unknown")))
+                raw_areas.append(result.get("raw_area", np.nan))
+                alive_areas.append(result.get("alive_area", np.nan))
+                modes.append(str(result.get("mode", "")))
+        out["jbf_status"] = statuses
+        out["jbf_raw_area"] = raw_areas
+        out["jbf_alive_area"] = alive_areas
+        out["jbf_mode"] = modes
+        return out
+
     def clear_threshold_table(self) -> None:
         if not hasattr(self, "threshold_tree"):
             return
@@ -2296,6 +2561,7 @@ class GroupCameraFeatureExplorer:
         plot_df = self.filtered_df[["row_id", "group", "camera_mode", "defect_type", "image_path", feature]].copy()
         plot_df[feature] = pd.to_numeric(plot_df[feature], errors="coerce")
         plot_df = plot_df.dropna(subset=[feature])
+        plot_df = self.attach_main_jbf_results(plot_df)
         threshold = self.parse_threshold()
 
         self.ax.clear()
@@ -2320,6 +2586,12 @@ class GroupCameraFeatureExplorer:
 
         for defect_type, part in plot_df.groupby("defect_type", sort=False):
             color = DEFECT_COLORS.get(defect_type, "#666666")
+            if self.main_jbf_enable_var.get() and "jbf_status" in part.columns:
+                edgecolors = part["jbf_status"].map({"alive": "#2ca02c", "dead": "#d62728", "unknown": "#9e9e9e"}).fillna("#9e9e9e").tolist()
+                linewidths = part["jbf_status"].map({"alive": 1.35, "dead": 1.35, "unknown": 0.5}).fillna(0.5).tolist()
+            else:
+                edgecolors = "white"
+                linewidths = 0.45
             artist = self.ax.scatter(
                 part["x"],
                 part[feature],
@@ -2327,12 +2599,22 @@ class GroupCameraFeatureExplorer:
                 alpha=0.72,
                 label=f"{defect_type} ({len(part)})",
                 color=color,
-                edgecolors="white",
-                linewidths=0.45,
+                edgecolors=edgecolors,
+                linewidths=linewidths,
                 picker=True,
                 pickradius=6,
             )
             self.artist_rows[artist] = part["row_id"].astype(int).tolist()
+
+        jbf_status = ""
+        if self.main_jbf_enable_var.get() and "jbf_status" in plot_df.columns:
+            alive = int((plot_df["jbf_status"] == "alive").sum())
+            dead = int((plot_df["jbf_status"] == "dead").sum())
+            unknown = int((plot_df["jbf_status"] == "unknown").sum())
+            evaluated = alive + dead
+            jbf_status = f" | JBF eval={evaluated}, alive={alive}, dead={dead}, unknown={unknown}"
+            self.ax.scatter([], [], s=54, facecolors="none", edgecolors="#2ca02c", linewidths=1.5, label=f"JBF Alive ({alive})")
+            self.ax.scatter([], [], s=54, facecolors="none", edgecolors="#d62728", linewidths=1.5, label=f"JBF Dead ({dead})")
 
         for _, row in summary.iterrows():
             cat = (str(row["group"]), str(row["camera_mode"]))
@@ -2379,7 +2661,7 @@ class GroupCameraFeatureExplorer:
         self.figure.tight_layout()
         self.canvas.draw_idle()
         self.status_var.set(
-            f"표시 rows={len(plot_df)} | groups={plot_df['group'].nunique()} | cameras={plot_df['camera_mode'].nunique()} | 점 클릭 시 이미지 창 갱신{threshold_status}"
+            f"표시 rows={len(plot_df)} | groups={plot_df['group'].nunique()} | cameras={plot_df['camera_mode'].nunique()} | 점 클릭 시 이미지 창 갱신{threshold_status}{jbf_status}"
         )
 
     def summary_frame(self, plot_df: pd.DataFrame, feature: str) -> pd.DataFrame:
@@ -2400,6 +2682,30 @@ class GroupCameraFeatureExplorer:
         for col in ["진불스크래치", "미세스크래치", "기타"]:
             if col not in summary.columns:
                 summary[col] = 0
+        for col in ["jbf_eval", "jbf_alive", "jbf_dead", "jbf_unknown", "jbf_alive_rate"]:
+            summary[col] = np.nan
+        if "jbf_status" in plot_df.columns:
+            jbf_counts = (
+                plot_df.pivot_table(
+                    index=["group", "camera_mode"],
+                    columns="jbf_status",
+                    values="row_id",
+                    aggfunc="count",
+                    fill_value=0,
+                )
+                .reset_index()
+                .rename_axis(None, axis=1)
+            )
+            summary = summary.drop(columns=["jbf_eval", "jbf_alive", "jbf_dead", "jbf_unknown", "jbf_alive_rate"], errors="ignore")
+            summary = summary.merge(jbf_counts, on=["group", "camera_mode"], how="left")
+            for status in ["alive", "dead", "unknown"]:
+                if status not in summary.columns:
+                    summary[status] = 0
+            summary["jbf_alive"] = pd.to_numeric(summary["alive"], errors="coerce").fillna(0).astype(int)
+            summary["jbf_dead"] = pd.to_numeric(summary["dead"], errors="coerce").fillna(0).astype(int)
+            summary["jbf_unknown"] = pd.to_numeric(summary["unknown"], errors="coerce").fillna(0).astype(int)
+            summary["jbf_eval"] = summary["jbf_alive"] + summary["jbf_dead"]
+            summary["jbf_alive_rate"] = summary["jbf_alive"] / summary["jbf_eval"].replace(0, np.nan)
         return summary
 
     def sorted_categories(self, summary: pd.DataFrame) -> list[tuple[str, str]]:
@@ -2445,6 +2751,11 @@ class GroupCameraFeatureExplorer:
                 int(row.get("진불스크래치", 0)),
                 int(row.get("미세스크래치", 0)),
                 int(row.get("기타", 0)),
+                "" if pd.isna(row.get("jbf_eval", np.nan)) else int(row.get("jbf_eval", 0)),
+                "" if pd.isna(row.get("jbf_alive", np.nan)) else int(row.get("jbf_alive", 0)),
+                "" if pd.isna(row.get("jbf_dead", np.nan)) else int(row.get("jbf_dead", 0)),
+                "" if pd.isna(row.get("jbf_unknown", np.nan)) else int(row.get("jbf_unknown", 0)),
+                "" if pd.isna(row.get("jbf_alive_rate", np.nan)) else self.format_percent(row.get("jbf_alive_rate")),
             ]
             self.summary_tree.insert("", tk.END, values=values)
 

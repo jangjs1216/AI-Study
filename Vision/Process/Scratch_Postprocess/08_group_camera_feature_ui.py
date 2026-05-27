@@ -38,6 +38,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
+from matplotlib.ticker import PercentFormatter  # noqa: E402
 from matplotlib import font_manager  # noqa: E402
 
 
@@ -1721,6 +1722,7 @@ class GroupCameraFeatureExplorer:
         self.main_jbf_results: dict[int, dict[str, object]] = {}
         self.main_jbf_cache: dict[tuple[object, ...], dict[str, object]] = {}
         self.main_jbf_scope_text = ""
+        self.jbf_rate_ax = None
         self.image_viewer = ImageViewer(root)
 
         self.csv_path_var = tk.StringVar(value=str(csv_path) if csv_path else "")
@@ -1747,6 +1749,7 @@ class GroupCameraFeatureExplorer:
         self.main_jbf_sample_size_var = tk.StringVar(value="500")
         self.main_jbf_seed_var = tk.StringVar(value="17")
         self.main_jbf_group_balanced_var = tk.BooleanVar(value=False)
+        self.main_jbf_rate_line_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="CSV를 로드하세요.")
 
         self._build_layout()
@@ -1885,6 +1888,12 @@ class GroupCameraFeatureExplorer:
             text="Group 균등 샘플링",
             variable=self.main_jbf_group_balanced_var,
         ).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Checkbutton(
+            main_jbf_top,
+            text="JBF Alive Checker",
+            variable=self.main_jbf_rate_line_var,
+            command=self.refresh_plot,
+        ).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Label(main_jbf_top, text="현재 Group/Camera 필터 대상에서 샘플링 후 Alive/Dead 평가").pack(side=tk.LEFT)
 
         ttk.Label(main_jbf_bottom, text="Diameter").pack(side=tk.LEFT, padx=(0, 4))
@@ -1979,6 +1988,11 @@ class GroupCameraFeatureExplorer:
         ttk.Label(table_frame, text="Group x Camera 평균/분포 요약").pack(side=tk.TOP, anchor="w")
         columns = [
             "group",
+            "jbf_alive",
+            "jbf_dead",
+            "jbf_eval",
+            "jbf_unknown",
+            "jbf_alive_rate",
             "camera_mode",
             "count",
             "mean",
@@ -1989,11 +2003,6 @@ class GroupCameraFeatureExplorer:
             "true_defect_count",
             "micro_count",
             "other_count",
-            "jbf_eval",
-            "jbf_alive",
-            "jbf_dead",
-            "jbf_unknown",
-            "jbf_alive_rate",
         ]
         self.summary_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=22)
         for col in columns:
@@ -2632,7 +2641,14 @@ class GroupCameraFeatureExplorer:
         plot_df = self.attach_main_jbf_results(plot_df)
         threshold = self.parse_threshold()
 
+        if self.jbf_rate_ax is not None:
+            try:
+                self.jbf_rate_ax.remove()
+            except ValueError:
+                pass
+            self.jbf_rate_ax = None
         self.ax.clear()
+        self.ax.patch.set_visible(True)
         self.artist_rows.clear()
         self.update_summary_table(plot_df, feature)
         self.update_threshold_table(plot_df, feature, threshold)
@@ -2648,6 +2664,55 @@ class GroupCameraFeatureExplorer:
         cat_to_x = {cat: idx for idx, cat in enumerate(categories)}
         plot_df["category"] = list(zip(plot_df["group"].astype(str), plot_df["camera_mode"].astype(str)))
         plot_df["x_base"] = plot_df["category"].map(cat_to_x)
+
+        if self.main_jbf_rate_line_var.get() and "jbf_status" in plot_df.columns and not summary.empty:
+            rate_rows = []
+            for _, row in summary.iterrows():
+                cat = (str(row["group"]), str(row["camera_mode"]))
+                x = cat_to_x.get(cat)
+                eval_count = safe_float(row.get("jbf_eval", np.nan))
+                alive_rate = safe_float(row.get("jbf_alive_rate", np.nan))
+                if x is None or not np.isfinite(eval_count) or eval_count <= 0 or not np.isfinite(alive_rate):
+                    continue
+                rate_rows.append((x, alive_rate * 100.0, (1.0 - alive_rate) * 100.0))
+            if rate_rows:
+                rate_rows.sort(key=lambda item: item[0])
+                xs = [item[0] for item in rate_rows]
+                alive_pct = [item[1] for item in rate_rows]
+                dead_pct = [item[2] for item in rate_rows]
+                self.jbf_rate_ax = self.ax.twinx()
+                self.jbf_rate_ax.set_zorder(0)
+                self.jbf_rate_ax.patch.set_visible(False)
+                self.ax.set_zorder(1)
+                self.ax.patch.set_visible(False)
+                self.jbf_rate_ax.plot(
+                    xs,
+                    alive_pct,
+                    color="#2ca02c",
+                    linestyle="-",
+                    linewidth=2.0,
+                    marker="o",
+                    markersize=4,
+                    alpha=0.82,
+                    label="JBF Alive %",
+                    zorder=0,
+                )
+                self.jbf_rate_ax.plot(
+                    xs,
+                    dead_pct,
+                    color="#d62728",
+                    linestyle="-",
+                    linewidth=2.0,
+                    marker="o",
+                    markersize=4,
+                    alpha=0.82,
+                    label="JBF Dead %",
+                    zorder=0,
+                )
+                self.jbf_rate_ax.set_ylim(0, 100)
+                self.jbf_rate_ax.set_ylabel("JBF Alive/Dead (%)")
+                self.jbf_rate_ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
+                self.jbf_rate_ax.grid(False)
 
         rng = np.random.default_rng(7)
         plot_df["x"] = plot_df["x_base"].astype(float) + rng.uniform(-0.22, 0.22, size=len(plot_df))
@@ -2669,6 +2734,7 @@ class GroupCameraFeatureExplorer:
                 color=color,
                 edgecolors=edgecolors,
                 linewidths=linewidths,
+                zorder=4,
                 picker=True,
                 pickradius=6,
             )
@@ -2725,7 +2791,12 @@ class GroupCameraFeatureExplorer:
         self.ax.set_ylabel(feature)
         self.ax.set_xlabel("group x camera_mode")
         self.ax.set_title(f"{feature}: group/camera 분포와 평균")
-        self.ax.legend(loc="best", fontsize=8)
+        handles, legend_labels = self.ax.get_legend_handles_labels()
+        if self.jbf_rate_ax is not None:
+            rate_handles, rate_labels = self.jbf_rate_ax.get_legend_handles_labels()
+            handles += rate_handles
+            legend_labels += rate_labels
+        self.ax.legend(handles, legend_labels, loc="best", fontsize=8)
         self.ax.grid(True, alpha=0.28)
         self.figure.tight_layout()
         self.canvas.draw_idle()
@@ -2810,6 +2881,11 @@ class GroupCameraFeatureExplorer:
         for _, row in summary.iterrows():
             values = [
                 row["group"],
+                "" if pd.isna(row.get("jbf_alive", np.nan)) else int(row.get("jbf_alive", 0)),
+                "" if pd.isna(row.get("jbf_dead", np.nan)) else int(row.get("jbf_dead", 0)),
+                "" if pd.isna(row.get("jbf_eval", np.nan)) else int(row.get("jbf_eval", 0)),
+                "" if pd.isna(row.get("jbf_unknown", np.nan)) else int(row.get("jbf_unknown", 0)),
+                "" if pd.isna(row.get("jbf_alive_rate", np.nan)) else self.format_percent(row.get("jbf_alive_rate")),
                 row["camera_mode"],
                 int(row["count"]),
                 self.format_number(row["mean"]),
@@ -2820,11 +2896,6 @@ class GroupCameraFeatureExplorer:
                 int(row.get("진불스크래치", 0)),
                 int(row.get("미세스크래치", 0)),
                 int(row.get("기타", 0)),
-                "" if pd.isna(row.get("jbf_eval", np.nan)) else int(row.get("jbf_eval", 0)),
-                "" if pd.isna(row.get("jbf_alive", np.nan)) else int(row.get("jbf_alive", 0)),
-                "" if pd.isna(row.get("jbf_dead", np.nan)) else int(row.get("jbf_dead", 0)),
-                "" if pd.isna(row.get("jbf_unknown", np.nan)) else int(row.get("jbf_unknown", 0)),
-                "" if pd.isna(row.get("jbf_alive_rate", np.nan)) else self.format_percent(row.get("jbf_alive_rate")),
             ]
             self.summary_tree.insert("", tk.END, values=values)
 

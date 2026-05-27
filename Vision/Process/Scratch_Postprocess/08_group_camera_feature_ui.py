@@ -238,10 +238,10 @@ class ImageViewer:
         )
         blur_scale.pack(side=tk.LEFT, padx=(0, 18))
 
-        ttk.Label(control_frame, text="K 그룹").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(control_frame, text="K 그룹(1=off)").pack(side=tk.LEFT, padx=(0, 6))
         k_scale = tk.Scale(
             control_frame,
-            from_=2,
+            from_=1,
             to=8,
             resolution=1,
             orient=tk.HORIZONTAL,
@@ -1566,7 +1566,7 @@ class ImageViewer:
         refine_min_area: int = 12,
     ) -> tuple[np.ndarray, np.ndarray, str]:
         kmeans_start = time.perf_counter()
-        k = int(np.clip(k, 2, 8))
+        k = int(np.clip(k, 1, 8))
         h, w, _ = array.shape
         if mask is not None and mask.shape == (h, w) and mask.any():
             valid_mask = mask.astype(bool)
@@ -1579,46 +1579,52 @@ class ImageViewer:
         if sample_size <= 0:
             empty = np.zeros_like(array)
             return empty, empty, "no valid pixels"
-        sample_idx = rng.choice(len(pixels), size=sample_size, replace=False)
-        sample = pixels[sample_idx]
+        if k == 1:
+            ordered_labels = np.zeros(len(pixels), dtype=np.int16)
+            ordered_centers = pixels.mean(axis=0, keepdims=True).astype(np.float32)
+            kmeans_mode_text = "off"
+        else:
+            sample_idx = rng.choice(len(pixels), size=sample_size, replace=False)
+            sample = pixels[sample_idx]
 
-        luma = sample @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-        quantiles = np.linspace(0.05, 0.95, k)
-        centers = []
-        for q in quantiles:
-            target = np.quantile(luma, q)
-            centers.append(sample[int(np.argmin(np.abs(luma - target)))])
-        centers = np.asarray(centers, dtype=np.float32)
+            luma = sample @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+            quantiles = np.linspace(0.05, 0.95, k)
+            centers = []
+            for q in quantiles:
+                target = np.quantile(luma, q)
+                centers.append(sample[int(np.argmin(np.abs(luma - target)))])
+            centers = np.asarray(centers, dtype=np.float32)
 
-        for _ in range(14):
-            distances = ((sample[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-            labels = distances.argmin(axis=1)
-            new_centers = centers.copy()
-            for cluster_id in range(k):
-                cluster_pixels = sample[labels == cluster_id]
-                if len(cluster_pixels):
-                    new_centers[cluster_id] = cluster_pixels.mean(axis=0)
-                else:
-                    new_centers[cluster_id] = sample[rng.integers(0, len(sample))]
-            if np.allclose(new_centers, centers, atol=0.5):
+            for _ in range(14):
+                distances = ((sample[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+                labels = distances.argmin(axis=1)
+                new_centers = centers.copy()
+                for cluster_id in range(k):
+                    cluster_pixels = sample[labels == cluster_id]
+                    if len(cluster_pixels):
+                        new_centers[cluster_id] = cluster_pixels.mean(axis=0)
+                    else:
+                        new_centers[cluster_id] = sample[rng.integers(0, len(sample))]
+                if np.allclose(new_centers, centers, atol=0.5):
+                    centers = new_centers
+                    break
                 centers = new_centers
-                break
-            centers = new_centers
 
-        all_labels = np.empty(len(pixels), dtype=np.int16)
-        chunk = 100000
-        for start in range(0, len(pixels), chunk):
-            stop = min(start + chunk, len(pixels))
-            distances = ((pixels[start:stop, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-            all_labels[start:stop] = distances.argmin(axis=1)
+            all_labels = np.empty(len(pixels), dtype=np.int16)
+            chunk = 100000
+            for start in range(0, len(pixels), chunk):
+                stop = min(start + chunk, len(pixels))
+                distances = ((pixels[start:stop, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+                all_labels[start:stop] = distances.argmin(axis=1)
 
-        center_luma = centers @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-        order = np.argsort(center_luma)
-        remap = np.zeros(k, dtype=np.int16)
-        for new_id, old_id in enumerate(order):
-            remap[old_id] = new_id
-        ordered_labels = remap[all_labels]
-        ordered_centers = centers[order]
+            center_luma = centers @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+            order = np.argsort(center_luma)
+            remap = np.zeros(k, dtype=np.int16)
+            for new_id, old_id in enumerate(order):
+                remap[old_id] = new_id
+            ordered_labels = remap[all_labels]
+            ordered_centers = centers[order]
+            kmeans_mode_text = f"{(time.perf_counter() - kmeans_start) * 1000:.1f}ms"
 
         palette = np.array(
             [
@@ -1634,7 +1640,10 @@ class ImageViewer:
             dtype=np.uint8,
         )
         clustered = np.zeros((h, w, 3), dtype=np.uint8)
-        clustered[valid_mask] = palette[ordered_labels]
+        if k == 1:
+            clustered[valid_mask] = array[valid_mask]
+        else:
+            clustered[valid_mask] = palette[ordered_labels]
         counts = np.bincount(ordered_labels, minlength=k)
         total = max(int(counts.sum()), 1)
         labels_2d = np.full((h, w), -1, dtype=np.int16)
@@ -1688,7 +1697,8 @@ class ImageViewer:
                 f"(d={jbf_diameter}, sc={jbf_sigma_color:.1f}, ss={jbf_sigma_space:.1f}, "
                 f"mo={jbf_morph_open}, mc={jbf_morph_close}, blur={jbf_blur_kernel}, th={jbf_threshold:.1f}/255)"
             )
-        return clustered, refined, f"kmeans={kmeans_ms:.1f}ms | {refine_text} | color: {' | '.join(stats)} | {spatial_text}"
+        kmeans_text = f"kmeans={kmeans_mode_text}" if k == 1 else f"kmeans={kmeans_ms:.1f}ms"
+        return clustered, refined, f"{kmeans_text} | {refine_text} | color: {' | '.join(stats)} | {spatial_text}"
 
 
 class GroupCameraFeatureExplorer:

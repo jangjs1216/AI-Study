@@ -1720,6 +1720,7 @@ class GroupCameraFeatureExplorer:
         self.artist_rows: dict[object, list[int]] = {}
         self.main_jbf_results: dict[int, dict[str, object]] = {}
         self.main_jbf_cache: dict[tuple[object, ...], dict[str, object]] = {}
+        self.main_jbf_scope_text = ""
         self.image_viewer = ImageViewer(root)
 
         self.csv_path_var = tk.StringVar(value=str(csv_path) if csv_path else "")
@@ -2045,6 +2046,7 @@ class GroupCameraFeatureExplorer:
             self.image_search_cache.clear()
             self.main_jbf_results.clear()
             self.main_jbf_cache.clear()
+            self.main_jbf_scope_text = ""
             self.status_var.set(f"이미지 루트 설정: {self.image_root}")
 
     def add_formula_term(self) -> None:
@@ -2190,6 +2192,7 @@ class GroupCameraFeatureExplorer:
         self.csv_path_var.set(str(path))
         self.main_jbf_results.clear()
         self.main_jbf_cache.clear()
+        self.main_jbf_scope_text = ""
         self.df = self._prepare_dataframe(df)
         self.numeric_features = self._numeric_feature_columns(self.df)
         self.custom_terms.clear()
@@ -2423,6 +2426,7 @@ class GroupCameraFeatureExplorer:
         params_key = self.main_jbf_params_tuple()
         params = self.main_jbf_params_dict()
         self.main_jbf_results.clear()
+        self.main_jbf_scope_text = sampled_text
         start = time.perf_counter()
         total = len(work)
         for index, (_idx, row) in enumerate(work.iterrows(), start=1):
@@ -2446,6 +2450,11 @@ class GroupCameraFeatureExplorer:
     def attach_main_jbf_results(self, plot_df: pd.DataFrame) -> pd.DataFrame:
         if plot_df.empty or not self.main_jbf_enable_var.get():
             return plot_df
+        if self.main_jbf_results:
+            result_ids = set(self.main_jbf_results)
+            plot_df = plot_df[plot_df["row_id"].astype(int).isin(result_ids)].copy()
+            if plot_df.empty:
+                return plot_df
         out = plot_df.copy()
         statuses = []
         raw_areas = []
@@ -2612,7 +2621,8 @@ class GroupCameraFeatureExplorer:
             dead = int((plot_df["jbf_status"] == "dead").sum())
             unknown = int((plot_df["jbf_status"] == "unknown").sum())
             evaluated = alive + dead
-            jbf_status = f" | JBF eval={evaluated}, alive={alive}, dead={dead}, unknown={unknown}"
+            scope_text = f", {self.main_jbf_scope_text}" if self.main_jbf_scope_text else ""
+            jbf_status = f" | JBF eval={evaluated}, alive={alive}, dead={dead}, unknown={unknown}{scope_text}"
             self.ax.scatter([], [], s=54, facecolors="none", edgecolors="#2ca02c", linewidths=1.5, label=f"JBF Alive ({alive})")
             self.ax.scatter([], [], s=54, facecolors="none", edgecolors="#d62728", linewidths=1.5, label=f"JBF Dead ({dead})")
 

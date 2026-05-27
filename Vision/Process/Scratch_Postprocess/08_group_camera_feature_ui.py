@@ -1746,6 +1746,7 @@ class GroupCameraFeatureExplorer:
         self.main_jbf_threshold_var = tk.DoubleVar(value=230.0)
         self.main_jbf_sample_size_var = tk.StringVar(value="500")
         self.main_jbf_seed_var = tk.StringVar(value="17")
+        self.main_jbf_group_balanced_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="CSV를 로드하세요.")
 
         self._build_layout()
@@ -1879,6 +1880,11 @@ class GroupCameraFeatureExplorer:
         ttk.Entry(main_jbf_top, textvariable=self.main_jbf_sample_size_var, width=8).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(main_jbf_top, text="Seed").pack(side=tk.LEFT, padx=(0, 4))
         ttk.Entry(main_jbf_top, textvariable=self.main_jbf_seed_var, width=8).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Checkbutton(
+            main_jbf_top,
+            text="Group 균등 샘플링",
+            variable=self.main_jbf_group_balanced_var,
+        ).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Label(main_jbf_top, text="현재 Group/Camera 필터 대상에서 샘플링 후 Alive/Dead 평가").pack(side=tk.LEFT)
 
         ttk.Label(main_jbf_bottom, text="Diameter").pack(side=tk.LEFT, padx=(0, 4))
@@ -2401,6 +2407,54 @@ class GroupCameraFeatureExplorer:
         self.main_jbf_cache[cache_key] = result
         return result.copy()
 
+    @staticmethod
+    def group_balanced_sample(work: pd.DataFrame, sample_size: int, seed: int) -> pd.DataFrame:
+        if sample_size <= 0 or len(work) <= sample_size or "group" not in work.columns:
+            return work.copy()
+
+        groups = [(group_key, part.copy()) for group_key, part in work.groupby("group", sort=False, dropna=False)]
+        if not groups:
+            return work.head(0).copy()
+
+        rng = np.random.default_rng(seed)
+        capacities = np.asarray([len(part) for _group_key, part in groups], dtype=np.int64)
+        allocation = np.zeros(len(groups), dtype=np.int64)
+        remaining = min(int(sample_size), int(capacities.sum()))
+        order = np.arange(len(groups))
+        rng.shuffle(order)
+
+        while remaining > 0:
+            active = [int(idx) for idx in order if allocation[int(idx)] < capacities[int(idx)]]
+            if not active:
+                break
+            take_each = max(1, remaining // len(active))
+            progressed = False
+            for idx in active:
+                available = int(capacities[idx] - allocation[idx])
+                take = min(take_each, available, remaining)
+                if take <= 0:
+                    continue
+                allocation[idx] += take
+                remaining -= take
+                progressed = True
+                if remaining <= 0:
+                    break
+            if not progressed:
+                break
+
+        sampled_parts = []
+        for idx, (_group_key, part) in enumerate(groups):
+            n = int(allocation[idx])
+            if n <= 0:
+                continue
+            random_state = int(rng.integers(0, np.iinfo(np.int32).max))
+            sampled_parts.append(part.sample(n=n, random_state=random_state))
+
+        if not sampled_parts:
+            return work.head(0).copy()
+        sampled = pd.concat(sampled_parts, axis=0)
+        return sampled.sample(frac=1.0, random_state=seed)
+
     def apply_main_jbf_batch(self) -> None:
         if self.df.empty:
             messagebox.showwarning("CSV 필요", "먼저 CSV를 로드하세요.")
@@ -2418,10 +2472,15 @@ class GroupCameraFeatureExplorer:
         sample_size = self.parse_int_text(self.main_jbf_sample_size_var.get(), default=500, minimum=0)
         seed = self.parse_int_text(self.main_jbf_seed_var.get(), default=17, minimum=0)
         if sample_size > 0 and len(work) > sample_size:
-            work = work.sample(n=sample_size, random_state=seed)
-            sampled_text = f"sampled={sample_size}/{candidate_count}, seed={seed}"
+            if self.main_jbf_group_balanced_var.get():
+                work = self.group_balanced_sample(work, sample_size=sample_size, seed=seed)
+                sampled_text = f"sampled={len(work)}/{candidate_count}, seed={seed}, group-balanced"
+            else:
+                work = work.sample(n=sample_size, random_state=seed)
+                sampled_text = f"sampled={sample_size}/{candidate_count}, seed={seed}, random"
         else:
-            sampled_text = f"sampled=all({len(work)}), seed={seed}"
+            mode_text = "group-balanced" if self.main_jbf_group_balanced_var.get() else "random"
+            sampled_text = f"sampled=all({len(work)}), seed={seed}, {mode_text}"
 
         params_key = self.main_jbf_params_tuple()
         params = self.main_jbf_params_dict()

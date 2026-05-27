@@ -1421,6 +1421,7 @@ class ImageViewer:
         refine_kernel: int = 3,
         refine_kernel_w: int | None = None,
         refine_kernel_h: int | None = None,
+        refine_enabled: bool = True,
         refine_angle_enabled: bool = False,
         angle_mask: np.ndarray | None = None,
         guide_array: np.ndarray | None = None,
@@ -1481,27 +1482,30 @@ class ImageViewer:
                 jbf_elapsed_ms += jbf_ms
                 jbf_modes.add(jbf_mode)
 
-            if refine_angle_enabled:
-                clean, angle_component_count = cls.morphology_clean_angle_aligned(
-                    work_cluster,
-                    angle_mask=angle_ref_mask,
-                    kernel_size=refine_kernel,
-                    kernel_w=refine_kernel_w,
-                    kernel_h=refine_kernel_h,
-                    open_iter=refine_open_iter,
-                    close_iter=refine_close_iter,
-                )
-                angle_component_total += angle_component_count
+            if refine_enabled:
+                if refine_angle_enabled:
+                    clean, angle_component_count = cls.morphology_clean_angle_aligned(
+                        work_cluster,
+                        angle_mask=angle_ref_mask,
+                        kernel_size=refine_kernel,
+                        kernel_w=refine_kernel_w,
+                        kernel_h=refine_kernel_h,
+                        open_iter=refine_open_iter,
+                        close_iter=refine_close_iter,
+                    )
+                    angle_component_total += angle_component_count
+                else:
+                    clean = cls.morphology_clean(
+                        work_cluster,
+                        kernel_size=refine_kernel,
+                        kernel_w=refine_kernel_w,
+                        kernel_h=refine_kernel_h,
+                        open_iter=refine_open_iter,
+                        close_iter=refine_close_iter,
+                    )
+                clean = cls.remove_small_components(clean, min_area=refine_min_area)
             else:
-                clean = cls.morphology_clean(
-                    work_cluster,
-                    kernel_size=refine_kernel,
-                    kernel_w=refine_kernel_w,
-                    kernel_h=refine_kernel_h,
-                    open_iter=refine_open_iter,
-                    close_iter=refine_close_iter,
-                )
-            clean = cls.remove_small_components(clean, min_area=refine_min_area)
+                clean = work_cluster
             refined_labels[clean] = cluster_id
             clean_area = int(clean.sum())
             cc = cls.connected_component_summary(clean)
@@ -1529,7 +1533,7 @@ class ImageViewer:
                     **row
                 )
             )
-        angle_text = f", angle_components={angle_component_total}" if refine_angle_enabled else ""
+        angle_text = f", angle_components={angle_component_total}" if refine_enabled and refine_angle_enabled else ""
         jbf_text = ""
         if jbf_enabled:
             mode_text = ",".join(sorted(jbf_modes)) if jbf_modes else "off"
@@ -1643,6 +1647,7 @@ class ImageViewer:
             refine_kernel=refine_kernel,
             refine_kernel_w=refine_kernel_w,
             refine_kernel_h=refine_kernel_h,
+            refine_enabled=refine_enabled,
             refine_angle_enabled=refine_angle_enabled,
             angle_mask=angle_mask,
             guide_array=array,
@@ -1658,7 +1663,7 @@ class ImageViewer:
             refine_close_iter=refine_close_iter,
             refine_min_area=refine_min_area,
         )
-        if refine_enabled:
+        if refine_enabled or jbf_enabled:
             refined = np.zeros((h, w, 3), dtype=np.uint8)
             refined_valid = refined_labels >= 0
             refined[refined_valid] = palette[refined_labels[refined_valid]]

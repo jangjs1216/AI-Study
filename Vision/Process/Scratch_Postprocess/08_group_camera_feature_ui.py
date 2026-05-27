@@ -17,6 +17,7 @@ import sys
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from collections import OrderedDict
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -64,6 +65,9 @@ DEFECT_COLORS = {
     "미세스크래치": "#ff7f0e",
     "기타": "#4c78a8",
 }
+
+MAIN_JBF_CACHE_VERSION = "main_jbf_v3_opencv"
+OPENCV_JBF_INSTALL_HINT = "OpenCV Joint Bilateral Filter는 opencv-contrib-python의 cv2.ximgproc가 필요합니다."
 
 KOREAN_FONT_CANDIDATES = [
     "Malgun Gothic",
@@ -1249,6 +1253,11 @@ class ImageViewer:
                 weight_sum += weight
         return weighted_sum / np.maximum(weight_sum, 1e-6)
 
+    @staticmethod
+    def has_opencv_joint_bilateral_filter() -> bool:
+        ximgproc = getattr(cv2, "ximgproc", None) if cv2 is not None else None
+        return callable(getattr(ximgproc, "jointBilateralFilter", None))
+
     @classmethod
     def jbf_refine_mask(
         cls,
@@ -1262,6 +1271,7 @@ class ImageViewer:
         morph_close: int,
         blur_kernel: int,
         threshold: float,
+        require_opencv_jbf: bool = False,
     ) -> tuple[np.ndarray, float, str]:
         start = time.perf_counter()
         cluster_bool = cluster_mask.astype(bool)
@@ -1296,7 +1306,7 @@ class ImageViewer:
         mode = "custom"
         filtered: np.ndarray | None = None
 
-        if cv2 is not None and hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "jointBilateralFilter"):
+        if cls.has_opencv_joint_bilateral_filter():
             try:
                 source_u8 = np.clip(source_roi * 255.0, 0, 255).astype(np.uint8)
                 filtered_u8 = cv2.ximgproc.jointBilateralFilter(
@@ -1307,9 +1317,15 @@ class ImageViewer:
                     sigma_space,
                 )
                 filtered = filtered_u8.astype(np.float32) / 255.0
-                mode = "ximgproc"
+                mode = "opencv-jbf"
             except Exception:  # noqa: BLE001 - optional OpenCV contrib API varies by build
                 filtered = None
+                if require_opencv_jbf:
+                    elapsed_ms = (time.perf_counter() - start) * 1000
+                    return cluster_bool, elapsed_ms, "opencv-jbf-error"
+        elif require_opencv_jbf:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            return cluster_bool, elapsed_ms, "opencv-jbf-unavailable"
 
         cost_estimate = int(source_roi.size) * diameter * diameter
         if filtered is None and cost_estimate <= 35_000_000:
@@ -1480,6 +1496,7 @@ class ImageViewer:
                     morph_close=jbf_morph_close,
                     blur_kernel=jbf_blur_kernel,
                     threshold=jbf_threshold,
+                    require_opencv_jbf=True,
                 )
                 jbf_elapsed_ms += jbf_ms
                 jbf_modes.add(jbf_mode)
@@ -1720,7 +1737,12 @@ class GroupCameraFeatureExplorer:
         self.custom_metric_counter = 1
         self.artist_rows: dict[object, list[int]] = {}
         self.main_jbf_results: dict[int, dict[str, object]] = {}
-        self.main_jbf_cache: dict[tuple[object, ...], dict[str, object]] = {}
+        self.main_jbf_cache: OrderedDict[tuple[object, ...], dict[str, object]] = OrderedDict()
+        self.main_jbf_image_cache: OrderedDict[tuple[object, ...], np.ndarray | None] = OrderedDict()
+        self.main_jbf_mask_cache: OrderedDict[tuple[object, ...], np.ndarray | None] = OrderedDict()
+        self.main_jbf_result_cache_limit = 20000
+        self.main_jbf_image_cache_limit = 96
+        self.main_jbf_mask_cache_limit = 512
         self.main_jbf_scope_text = ""
         self.jbf_rate_ax = None
         self.image_viewer = ImageViewer(root)
@@ -2059,9 +2081,7 @@ class GroupCameraFeatureExplorer:
             self.image_root = Path(selected)
             self.image_root_var.set(str(self.image_root))
             self.image_search_cache.clear()
-            self.main_jbf_results.clear()
-            self.main_jbf_cache.clear()
-            self.main_jbf_scope_text = ""
+            self.clear_main_jbf_state(clear_arrays=True)
             self.status_var.set(f"이미지 루트 설정: {self.image_root}")
 
     def add_formula_term(self) -> None:
@@ -2205,9 +2225,8 @@ class GroupCameraFeatureExplorer:
         self.csv_path = path
         self.csv_dir = path.parent
         self.csv_path_var.set(str(path))
-        self.main_jbf_results.clear()
-        self.main_jbf_cache.clear()
-        self.main_jbf_scope_text = ""
+        self.image_search_cache.clear()
+        self.clear_main_jbf_state(clear_arrays=True)
         self.df = self._prepare_dataframe(df)
         self.numeric_features = self._numeric_feature_columns(self.df)
         self.custom_terms.clear()
@@ -2364,31 +2383,132 @@ class GroupCameraFeatureExplorer:
             "threshold": float(self.main_jbf_threshold_var.get()),
         }
 
+    def clear_main_jbf_state(self, clear_arrays: bool = False) -> None:
+        self.main_jbf_results.clear()
+        self.main_jbf_cache.clear()
+        self.main_jbf_scope_text = ""
+        if clear_arrays:
+            self.main_jbf_image_cache.clear()
+            self.main_jbf_mask_cache.clear()
+
+    @staticmethod
+    def lru_get(cache: OrderedDict[tuple[object, ...], object], key: tuple[object, ...]) -> tuple[bool, object]:
+        if key not in cache:
+            return False, None
+        value = cache.pop(key)
+        cache[key] = value
+        return True, value
+
+    @staticmethod
+    def lru_put(
+        cache: OrderedDict[tuple[object, ...], object],
+        key: tuple[object, ...],
+        value: object,
+        limit: int,
+    ) -> None:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > limit:
+            cache.popitem(last=False)
+
+    @staticmethod
+    def main_jbf_file_token(path: Path | None) -> tuple[object, ...]:
+        if path is None:
+            return ("missing",)
+        try:
+            resolved = str(path.resolve())
+        except Exception:  # noqa: BLE001 - path normalization should not block batch evaluation
+            resolved = str(path)
+        try:
+            stat = path.stat()
+        except OSError:
+            return ("not_found", resolved)
+        return ("file", resolved, int(stat.st_size), int(stat.st_mtime_ns))
+
+    def cached_main_jbf_rgb_array(
+        self,
+        path: Path | None,
+        expected_shape: tuple[int, int] | None,
+        file_token: tuple[object, ...],
+    ) -> np.ndarray | None:
+        shape_key = tuple(expected_shape) if expected_shape is not None else None
+        key = ("rgb", file_token, shape_key)
+        hit, value = self.lru_get(self.main_jbf_image_cache, key)
+        if hit:
+            return value  # type: ignore[return-value]
+        value = ImageViewer.load_rgb_array(path, expected_shape)
+        self.lru_put(self.main_jbf_image_cache, key, value, self.main_jbf_image_cache_limit)
+        return value
+
+    def cached_main_jbf_mask_array(
+        self,
+        path: Path | None,
+        expected_shape: tuple[int, int],
+        file_token: tuple[object, ...],
+    ) -> np.ndarray | None:
+        key = ("mask", file_token, tuple(expected_shape))
+        hit, value = self.lru_get(self.main_jbf_mask_cache, key)
+        if hit:
+            return value  # type: ignore[return-value]
+        value = ImageViewer.load_mask_array(path, expected_shape)
+        self.lru_put(self.main_jbf_mask_cache, key, value, self.main_jbf_mask_cache_limit)
+        return value
+
+    def get_main_jbf_result_cache(self, key: tuple[object, ...]) -> dict[str, object] | None:
+        hit, value = self.lru_get(self.main_jbf_cache, key)
+        if not hit:
+            return None
+        cached = dict(value)  # type: ignore[arg-type]
+        cached["cache_hit"] = True
+        return cached
+
+    def set_main_jbf_result_cache(self, key: tuple[object, ...], result: dict[str, object]) -> None:
+        stored = dict(result)
+        stored["cache_hit"] = False
+        self.lru_put(self.main_jbf_cache, key, stored, self.main_jbf_result_cache_limit)
+
     def evaluate_main_jbf_row(self, row: pd.Series, params: dict[str, object], params_key: tuple[object, ...]) -> dict[str, object]:
         row_id = int(row.get("row_id"))
         image_path = self.resolve_image_path(row.get("image_path")) if "image_path" in row.index else None
         if image_path is None and "mask_raw_path" in row.index:
             image_path = self.resolve_image_path(row.get("mask_raw_path"))
         mask_path = self.resolve_image_path(row.get("mask_path")) if "mask_path" in row.index else None
-        cache_key = (row_id, str(image_path), str(mask_path), params_key)
-        if cache_key in self.main_jbf_cache:
-            return self.main_jbf_cache[cache_key].copy()
+        image_token = self.main_jbf_file_token(image_path)
+        mask_token = self.main_jbf_file_token(mask_path)
+        cache_key = (MAIN_JBF_CACHE_VERSION, row_id, image_token, mask_token, params_key)
+        cached_result = self.get_main_jbf_result_cache(cache_key)
+        if cached_result is not None:
+            return cached_result
 
         if image_path is None or mask_path is None:
-            result = {"status": "unknown", "raw_area": 0, "alive_area": 0, "elapsed_ms": 0.0, "mode": "missing_path"}
-            self.main_jbf_cache[cache_key] = result
-            return result.copy()
+            result = {
+                "status": "unknown",
+                "raw_area": 0,
+                "alive_area": 0,
+                "elapsed_ms": 0.0,
+                "mode": "missing_path",
+                "cache_hit": False,
+            }
+            self.set_main_jbf_result_cache(cache_key, result)
+            return result
 
         try:
-            guide = ImageViewer.load_rgb_array(image_path)
+            guide = self.cached_main_jbf_rgb_array(image_path, None, image_token)
             if guide is None:
                 raise FileNotFoundError(str(image_path))
-            mask = ImageViewer.load_mask_array(mask_path, guide.shape[:2])
+            mask = self.cached_main_jbf_mask_array(mask_path, guide.shape[:2], mask_token)
             if mask is None:
                 raise FileNotFoundError(str(mask_path))
             raw_area = int(mask.sum())
             if raw_area <= 0:
-                result = {"status": "dead", "raw_area": 0, "alive_area": 0, "elapsed_ms": 0.0, "mode": "empty_mask"}
+                result = {
+                    "status": "dead",
+                    "raw_area": 0,
+                    "alive_area": 0,
+                    "elapsed_ms": 0.0,
+                    "mode": "empty_mask",
+                    "cache_hit": False,
+                }
             else:
                 refined_mask, elapsed_ms, mode = ImageViewer.jbf_refine_mask(
                     mask,
@@ -2401,20 +2521,39 @@ class GroupCameraFeatureExplorer:
                     morph_close=int(params["morph_close"]),
                     blur_kernel=int(params["blur_kernel"]),
                     threshold=float(params["threshold"]),
+                    require_opencv_jbf=True,
                 )
                 alive_area = int(refined_mask.sum())
-                result = {
-                    "status": "alive" if alive_area > 0 else "dead",
-                    "raw_area": raw_area,
-                    "alive_area": alive_area,
-                    "elapsed_ms": float(elapsed_ms),
-                    "mode": mode,
-                }
+                if mode in {"opencv-jbf-unavailable", "opencv-jbf-error"}:
+                    result = {
+                        "status": "unknown",
+                        "raw_area": raw_area,
+                        "alive_area": 0,
+                        "elapsed_ms": float(elapsed_ms),
+                        "mode": mode,
+                        "cache_hit": False,
+                    }
+                else:
+                    result = {
+                        "status": "alive" if alive_area > 0 else "dead",
+                        "raw_area": raw_area,
+                        "alive_area": alive_area,
+                        "elapsed_ms": float(elapsed_ms),
+                        "mode": mode,
+                        "cache_hit": False,
+                    }
         except Exception as exc:  # noqa: BLE001 - batch evaluation should continue per row
-            result = {"status": "unknown", "raw_area": 0, "alive_area": 0, "elapsed_ms": 0.0, "mode": f"error:{type(exc).__name__}"}
+            result = {
+                "status": "unknown",
+                "raw_area": 0,
+                "alive_area": 0,
+                "elapsed_ms": 0.0,
+                "mode": f"error:{type(exc).__name__}",
+                "cache_hit": False,
+            }
 
-        self.main_jbf_cache[cache_key] = result
-        return result.copy()
+        self.set_main_jbf_result_cache(cache_key, result)
+        return result
 
     @staticmethod
     def group_balanced_sample(work: pd.DataFrame, sample_size: int, seed: int) -> pd.DataFrame:
@@ -2471,6 +2610,11 @@ class GroupCameraFeatureExplorer:
         if "mask_path" not in self.df.columns:
             messagebox.showwarning("mask_path 필요", "CSV에 mask_path 컬럼이 필요합니다.")
             return
+        if not ImageViewer.has_opencv_joint_bilateral_filter():
+            install_text = f"{OPENCV_JBF_INSTALL_HINT}\n\n설치 예: python -m pip install opencv-contrib-python"
+            messagebox.showwarning("OpenCV JBF 필요", install_text)
+            self.status_var.set("JBF 평가 중단: opencv-contrib-python/cv2.ximgproc가 필요합니다.")
+            return
 
         work = self.filtered().copy()
         if work.empty:
@@ -2497,9 +2641,12 @@ class GroupCameraFeatureExplorer:
         self.main_jbf_scope_text = sampled_text
         start = time.perf_counter()
         total = len(work)
+        cache_hits = 0
         for index, (_idx, row) in enumerate(work.iterrows(), start=1):
             row_id = int(row.get("row_id"))
-            self.main_jbf_results[row_id] = self.evaluate_main_jbf_row(row, params, params_key)
+            result = self.evaluate_main_jbf_row(row, params, params_key)
+            cache_hits += int(bool(result.get("cache_hit", False)))
+            self.main_jbf_results[row_id] = result
             if index == 1 or index % 10 == 0 or index == total:
                 self.status_var.set(f"JBF 평가 중 {index}/{total} | {sampled_text}")
                 self.root.update_idletasks()
@@ -2512,7 +2659,8 @@ class GroupCameraFeatureExplorer:
         self.main_jbf_enable_var.set(True)
         self.refresh_plot()
         self.status_var.set(
-            f"JBF 평가 완료 | {sampled_text} | alive={alive}, dead={dead}, unknown={unknown}, elapsed={elapsed_ms:.1f}ms"
+            f"JBF 평가 완료 | {sampled_text} | alive={alive}, dead={dead}, unknown={unknown}, "
+            f"cache_hit={cache_hits}/{total}, elapsed={elapsed_ms:.1f}ms"
         )
 
     def attach_main_jbf_results(self, plot_df: pd.DataFrame) -> pd.DataFrame:

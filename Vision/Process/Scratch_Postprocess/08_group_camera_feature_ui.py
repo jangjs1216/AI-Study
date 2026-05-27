@@ -178,13 +178,13 @@ class ImageViewer:
         self.refine_kernel_h_var = tk.IntVar(value=3)
         self.refine_angle_var = tk.BooleanVar(value=False)
         self.jbf_enable_var = tk.BooleanVar(value=False)
-        self.jbf_diameter_var = tk.IntVar(value=7)
-        self.jbf_sigma_color_var = tk.DoubleVar(value=35.0)
-        self.jbf_sigma_space_var = tk.DoubleVar(value=7.0)
-        self.jbf_morph_open_var = tk.IntVar(value=0)
-        self.jbf_morph_close_var = tk.IntVar(value=0)
-        self.jbf_blur_kernel_var = tk.IntVar(value=1)
-        self.jbf_threshold_var = tk.DoubleVar(value=0.5)
+        self.jbf_diameter_var = tk.IntVar(value=15)
+        self.jbf_sigma_color_var = tk.DoubleVar(value=30.0)
+        self.jbf_sigma_space_var = tk.DoubleVar(value=15.0)
+        self.jbf_morph_open_var = tk.IntVar(value=3)
+        self.jbf_morph_close_var = tk.IntVar(value=5)
+        self.jbf_blur_kernel_var = tk.IntVar(value=3)
+        self.jbf_threshold_var = tk.DoubleVar(value=230.0)
 
     def _ensure_window(self) -> None:
         if self.window is not None and self.window.winfo_exists():
@@ -468,12 +468,12 @@ class ImageViewer:
             command=lambda _value: self.schedule_render(),
         )
         jbf_blur_scale.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(jbf_refine_row, text="Threshold").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(jbf_refine_row, text="Threshold(0-255)").pack(side=tk.LEFT, padx=(0, 4))
         jbf_threshold_scale = tk.Scale(
             jbf_refine_row,
-            from_=0.05,
-            to=0.95,
-            resolution=0.01,
+            from_=0.0,
+            to=255.0,
+            resolution=1.0,
             orient=tk.HORIZONTAL,
             variable=self.jbf_threshold_var,
             length=120,
@@ -588,13 +588,13 @@ class ImageViewer:
         self.refine_close_iter_var.set(1)
         self.refine_min_area_var.set(12)
         self.jbf_enable_var.set(False)
-        self.jbf_diameter_var.set(7)
-        self.jbf_sigma_color_var.set(35.0)
-        self.jbf_sigma_space_var.set(7.0)
-        self.jbf_morph_open_var.set(0)
-        self.jbf_morph_close_var.set(0)
-        self.jbf_blur_kernel_var.set(1)
-        self.jbf_threshold_var.set(0.5)
+        self.jbf_diameter_var.set(15)
+        self.jbf_sigma_color_var.set(30.0)
+        self.jbf_sigma_space_var.set(15.0)
+        self.jbf_morph_open_var.set(3)
+        self.jbf_morph_close_var.set(5)
+        self.jbf_blur_kernel_var.set(3)
+        self.jbf_threshold_var.set(230.0)
         self.overlap_var.set(False)
         self.render_images()
 
@@ -1277,7 +1277,8 @@ class ImageViewer:
         blur_kernel = cls.normalize_odd_kernel(blur_kernel, minimum=1, maximum=31) if int(blur_kernel) > 0 else 0
         sigma_color = max(float(sigma_color), 1e-3)
         sigma_space = max(float(sigma_space), 1e-3)
-        threshold = float(np.clip(threshold, 0.01, 0.99))
+        threshold_value = float(np.clip(threshold, 0.0, 255.0))
+        threshold_unit = threshold_value / 255.0
         morph_open = int(np.clip(morph_open, 0, 10))
         morph_close = int(np.clip(morph_close, 0, 10))
 
@@ -1334,7 +1335,7 @@ class ImageViewer:
 
         if blur_kernel > 1:
             filtered = cls.blur_soft_mask(filtered, blur_kernel)
-        clean_roi = (filtered >= threshold) & valid_roi
+        clean_roi = (filtered >= threshold_unit) & valid_roi
         if morph_open or morph_close:
             clean_roi = cls.morphology_clean(
                 clean_roi,
@@ -1426,13 +1427,13 @@ class ImageViewer:
         angle_mask: np.ndarray | None = None,
         guide_array: np.ndarray | None = None,
         jbf_enabled: bool = False,
-        jbf_diameter: int = 7,
-        jbf_sigma_color: float = 35.0,
-        jbf_sigma_space: float = 7.0,
-        jbf_morph_open: int = 0,
-        jbf_morph_close: int = 0,
-        jbf_blur_kernel: int = 0,
-        jbf_threshold: float = 0.5,
+        jbf_diameter: int = 15,
+        jbf_sigma_color: float = 30.0,
+        jbf_sigma_space: float = 15.0,
+        jbf_morph_open: int = 3,
+        jbf_morph_close: int = 5,
+        jbf_blur_kernel: int = 3,
+        jbf_threshold: float = 230.0,
         refine_open_iter: int = 1,
         refine_close_iter: int = 1,
         refine_min_area: int = 12,
@@ -1553,13 +1554,13 @@ class ImageViewer:
         refine_angle_enabled: bool = False,
         angle_mask: np.ndarray | None = None,
         jbf_enabled: bool = False,
-        jbf_diameter: int = 7,
-        jbf_sigma_color: float = 35.0,
-        jbf_sigma_space: float = 7.0,
-        jbf_morph_open: int = 0,
-        jbf_morph_close: int = 0,
-        jbf_blur_kernel: int = 0,
-        jbf_threshold: float = 0.5,
+        jbf_diameter: int = 15,
+        jbf_sigma_color: float = 30.0,
+        jbf_sigma_space: float = 15.0,
+        jbf_morph_open: int = 3,
+        jbf_morph_close: int = 5,
+        jbf_blur_kernel: int = 3,
+        jbf_threshold: float = 230.0,
         refine_open_iter: int = 1,
         refine_close_iter: int = 1,
         refine_min_area: int = 12,
@@ -1685,7 +1686,7 @@ class ImageViewer:
         if jbf_enabled:
             refine_text += (
                 f"(d={jbf_diameter}, sc={jbf_sigma_color:.1f}, ss={jbf_sigma_space:.1f}, "
-                f"mo={jbf_morph_open}, mc={jbf_morph_close}, blur={jbf_blur_kernel}, th={jbf_threshold:.2f})"
+                f"mo={jbf_morph_open}, mc={jbf_morph_close}, blur={jbf_blur_kernel}, th={jbf_threshold:.1f}/255)"
             )
         return clustered, refined, f"kmeans={kmeans_ms:.1f}ms | {refine_text} | color: {' | '.join(stats)} | {spatial_text}"
 

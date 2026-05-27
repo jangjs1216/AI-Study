@@ -2709,7 +2709,21 @@ class GroupCameraFeatureExplorer:
                     label="JBF Dead %",
                     zorder=0,
                 )
-                self.jbf_rate_ax.set_ylim(0, 100)
+                rate_values = alive_pct + dead_pct
+                rate_min = min(rate_values)
+                rate_max = max(rate_values)
+                rate_margin = max((rate_max - rate_min) * 0.12, 5.0)
+                y_min = max(0.0, rate_min - rate_margin)
+                y_max = min(100.0, rate_max + rate_margin)
+                if y_max - y_min < 20.0:
+                    center = (y_min + y_max) / 2.0
+                    y_min = max(0.0, center - 10.0)
+                    y_max = min(100.0, center + 10.0)
+                if rate_max >= 98.0:
+                    y_min = min(y_min, 90.0)
+                if rate_min <= 2.0:
+                    y_max = max(y_max, 10.0)
+                self.jbf_rate_ax.set_ylim(y_min, y_max)
                 self.jbf_rate_ax.set_ylabel("JBF Alive/Dead (%)")
                 self.jbf_rate_ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
                 self.jbf_rate_ax.grid(False)

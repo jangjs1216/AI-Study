@@ -21,6 +21,7 @@ from collections import OrderedDict
 from copy import deepcopy
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -147,8 +148,19 @@ def safe_float(value: object) -> float:
 
 
 class ImageViewer:
-    def __init__(self, master: tk.Tk) -> None:
+    def __init__(
+        self,
+        master: tk.Tk,
+        filter_pipeline_provider: Callable[[], dict[str, object]] | None = None,
+        pipeline_preview_renderer: Callable[
+            [np.ndarray, np.ndarray | None, dict[str, object]],
+            tuple[np.ndarray, np.ndarray, np.ndarray, str],
+        ]
+        | None = None,
+    ) -> None:
         self.master = master
+        self.filter_pipeline_provider = filter_pipeline_provider
+        self.pipeline_preview_renderer = pipeline_preview_renderer
         self.window: tk.Toplevel | None = None
         self.meta_label: ttk.Label | None = None
         self.adjusted_image_label: ttk.Label | None = None
@@ -167,6 +179,7 @@ class ImageViewer:
         self.source_var = tk.StringVar(value="image_path")
         self.source_combo: ttk.Combobox | None = None
         self.render_after_id: str | None = None
+        self.active_filter_pipeline: dict[str, object] | None = None
         self.contrast_var = tk.DoubleVar(value=1.0)
         self.blur_var = tk.DoubleVar(value=0.0)
         self.cluster_k_var = tk.IntVar(value=4)
@@ -298,6 +311,7 @@ class ImageViewer:
             variable=self.overlap_var,
             command=self.schedule_render,
         ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(control_frame, text="현재 Filter 가져오기", command=self.apply_current_filter_pipeline).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(control_frame, text="Reset", command=self.reset_controls).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(control_frame, text="K-Means는 보정/contrast/blur 적용 후 RGB 픽셀값 기준").pack(side=tk.LEFT)
 
@@ -602,7 +616,78 @@ class ImageViewer:
         self.jbf_blur_kernel_var.set(3)
         self.jbf_threshold_var.set(230.0)
         self.overlap_var.set(False)
+        self.active_filter_pipeline = None
         self.render_images()
+
+    def apply_current_filter_pipeline(self) -> None:
+        if self.filter_pipeline_provider is None:
+            messagebox.showwarning("Filter 없음", "메인 화면의 Filter Pipeline을 가져올 수 없습니다.")
+            return
+        pipeline = deepcopy(self.filter_pipeline_provider())
+        self.active_filter_pipeline = pipeline
+        source_name = str(pipeline.get("source", self.source_var.get()))
+        source_changed = False
+        if source_name in self.source_paths:
+            source_changed = self.source_var.get() != source_name
+            self.source_var.set(source_name)
+
+        self.contrast_var.set(float(pipeline.get("contrast", 1.0)))
+        self.blur_var.set(float(pipeline.get("blur", 0.0)))
+        self.cluster_k_var.set(int(pipeline.get("k", 1)) if bool(pipeline.get("kmeans_enabled", False)) else 1)
+        self.directional_cancel_var.set(False)
+        self.cluster_mask_only_var.set(True)
+        self.refine_enable_var.set(bool(pipeline.get("refine_enabled", False)))
+        self.refine_angle_var.set(bool(pipeline.get("refine_angle_enabled", False)))
+        self.refine_kernel_var.set(int(pipeline.get("refine_kernel", 3)))
+        self.refine_kernel_w_var.set(int(pipeline.get("refine_kernel_w", 3)))
+        self.refine_kernel_h_var.set(int(pipeline.get("refine_kernel_h", 3)))
+        self.refine_open_iter_var.set(int(pipeline.get("refine_open_iter", 1)))
+        self.refine_close_iter_var.set(int(pipeline.get("refine_close_iter", 1)))
+        self.refine_min_area_var.set(int(pipeline.get("refine_min_area", 12)))
+        self.jbf_enable_var.set(bool(pipeline.get("jbf_enabled", False)))
+        self.jbf_diameter_var.set(int(pipeline.get("jbf_diameter", 15)))
+        self.jbf_sigma_color_var.set(float(pipeline.get("jbf_sigma_color", 30.0)))
+        self.jbf_sigma_space_var.set(float(pipeline.get("jbf_sigma_space", 15.0)))
+        self.jbf_morph_open_var.set(int(pipeline.get("jbf_morph_open", 3)))
+        self.jbf_morph_close_var.set(int(pipeline.get("jbf_morph_close", 5)))
+        self.jbf_blur_kernel_var.set(int(pipeline.get("jbf_blur_kernel", 3)))
+        self.jbf_threshold_var.set(float(pipeline.get("jbf_threshold", 230.0)))
+        if source_changed and self.original_array is not None:
+            self.load_selected_source()
+        else:
+            self.render_images()
+
+    def active_pipeline_from_controls(self) -> dict[str, object]:
+        pipeline = deepcopy(self.active_filter_pipeline) if self.active_filter_pipeline is not None else {}
+        pipeline.update(
+            {
+                "source": self.source_var.get(),
+                "contrast": float(self.contrast_var.get()),
+                "blur": float(self.blur_var.get()),
+                "kmeans_enabled": int(self.cluster_k_var.get()) > 1,
+                "k": int(self.cluster_k_var.get()),
+                "refine_enabled": bool(self.refine_enable_var.get()),
+                "refine_kernel": int(self.refine_kernel_var.get()),
+                "refine_kernel_w": int(self.refine_kernel_w_var.get()),
+                "refine_kernel_h": int(self.refine_kernel_h_var.get()),
+                "refine_angle_enabled": bool(self.refine_angle_var.get()),
+                "refine_open_iter": int(self.refine_open_iter_var.get()),
+                "refine_close_iter": int(self.refine_close_iter_var.get()),
+                "refine_min_area": int(self.refine_min_area_var.get()),
+                "jbf_enabled": bool(self.jbf_enable_var.get()),
+                "jbf_diameter": int(self.jbf_diameter_var.get()),
+                "jbf_sigma_color": float(self.jbf_sigma_color_var.get()),
+                "jbf_sigma_space": float(self.jbf_sigma_space_var.get()),
+                "jbf_morph_open": int(self.jbf_morph_open_var.get()),
+                "jbf_morph_close": int(self.jbf_morph_close_var.get()),
+                "jbf_blur_kernel": int(self.jbf_blur_kernel_var.get()),
+                "jbf_threshold": float(self.jbf_threshold_var.get()),
+            }
+        )
+        pipeline.setdefault("name", "Patch Filter Preview")
+        pipeline.setdefault("cluster_select", "all")
+        pipeline.setdefault("post_order", "jbf_then_refine")
+        return pipeline
 
     def schedule_render(self) -> None:
         if self.window is None or not self.window.winfo_exists():
@@ -621,31 +706,37 @@ class ImageViewer:
         blur_radius = float(self.blur_var.get())
         k = int(self.cluster_k_var.get())
         base, correction_text = self.make_analysis_base()
-        adjusted = self.apply_blur(self.apply_contrast(base, contrast), blur_radius)
         angle_enabled = bool(self.refine_angle_var.get())
-        cluster_mask = self.mask_array if self.cluster_mask_only_var.get() else None
-        clustered, refined, stats_text = self.kmeans_cluster_image(
-            adjusted,
-            k,
-            mask=cluster_mask,
-            refine_enabled=bool(self.refine_enable_var.get()),
-            refine_kernel=int(self.refine_kernel_var.get()),
-            refine_kernel_w=int(self.refine_kernel_w_var.get()),
-            refine_kernel_h=int(self.refine_kernel_h_var.get()),
-            refine_angle_enabled=angle_enabled,
-            angle_mask=self.mask_array,
-            jbf_enabled=bool(self.jbf_enable_var.get()),
-            jbf_diameter=int(self.jbf_diameter_var.get()),
-            jbf_sigma_color=float(self.jbf_sigma_color_var.get()),
-            jbf_sigma_space=float(self.jbf_sigma_space_var.get()),
-            jbf_morph_open=int(self.jbf_morph_open_var.get()),
-            jbf_morph_close=int(self.jbf_morph_close_var.get()),
-            jbf_blur_kernel=int(self.jbf_blur_kernel_var.get()),
-            jbf_threshold=float(self.jbf_threshold_var.get()),
-            refine_open_iter=int(self.refine_open_iter_var.get()),
-            refine_close_iter=int(self.refine_close_iter_var.get()),
-            refine_min_area=int(self.refine_min_area_var.get()),
-        )
+        if self.active_filter_pipeline is not None and self.pipeline_preview_renderer is not None:
+            pipeline = self.active_pipeline_from_controls()
+            adjusted, clustered, refined, stats_text = self.pipeline_preview_renderer(base, self.mask_array, pipeline)
+            angle_enabled = bool(pipeline.get("refine_angle_enabled", False))
+            stats_text = f"pipeline={pipeline.get('name', '')} | {stats_text}"
+        else:
+            adjusted = self.apply_blur(self.apply_contrast(base, contrast), blur_radius)
+            cluster_mask = self.mask_array if self.cluster_mask_only_var.get() else None
+            clustered, refined, stats_text = self.kmeans_cluster_image(
+                adjusted,
+                k,
+                mask=cluster_mask,
+                refine_enabled=bool(self.refine_enable_var.get()),
+                refine_kernel=int(self.refine_kernel_var.get()),
+                refine_kernel_w=int(self.refine_kernel_w_var.get()),
+                refine_kernel_h=int(self.refine_kernel_h_var.get()),
+                refine_angle_enabled=angle_enabled,
+                angle_mask=self.mask_array,
+                jbf_enabled=bool(self.jbf_enable_var.get()),
+                jbf_diameter=int(self.jbf_diameter_var.get()),
+                jbf_sigma_color=float(self.jbf_sigma_color_var.get()),
+                jbf_sigma_space=float(self.jbf_sigma_space_var.get()),
+                jbf_morph_open=int(self.jbf_morph_open_var.get()),
+                jbf_morph_close=int(self.jbf_morph_close_var.get()),
+                jbf_blur_kernel=int(self.jbf_blur_kernel_var.get()),
+                jbf_threshold=float(self.jbf_threshold_var.get()),
+                refine_open_iter=int(self.refine_open_iter_var.get()),
+                refine_close_iter=int(self.refine_close_iter_var.get()),
+                refine_min_area=int(self.refine_min_area_var.get()),
+            )
         if self.overlap_var.get():
             clustered_display = self.overlay_result(adjusted, clustered, alpha=0.8)
             refined_display = self.overlay_result(adjusted, refined, alpha=0.8)
@@ -1747,7 +1838,11 @@ class GroupCameraFeatureExplorer:
         self.main_filter_scope_text = ""
         self.filter_rate_ax = None
         self.filter_pipelines: list[dict[str, object]] = [self.default_filter_pipeline()]
-        self.image_viewer = ImageViewer(root)
+        self.image_viewer = ImageViewer(
+            root,
+            filter_pipeline_provider=self.selected_filter_pipeline,
+            pipeline_preview_renderer=self.render_filter_pipeline_preview,
+        )
 
         self.csv_path_var = tk.StringVar(value=str(csv_path) if csv_path else "")
         self.image_root_var = tk.StringVar(value=str(image_root) if image_root else "")
@@ -2834,6 +2929,94 @@ class GroupCameraFeatureExplorer:
         )
         failed = mode in {"opencv-jbf-unavailable", "opencv-jbf-error"}
         return refined_mask, f"jbf={mode}", failed
+
+    def render_filter_pipeline_preview(
+        self,
+        source_array: np.ndarray,
+        mask_array: np.ndarray | None,
+        pipeline: dict[str, object],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+        start = time.perf_counter()
+        adjusted = ImageViewer.apply_blur(
+            ImageViewer.apply_contrast(source_array, float(pipeline.get("contrast", 1.0))),
+            float(pipeline.get("blur", 0.0)),
+        )
+        h, w, _ = adjusted.shape
+        if mask_array is not None and mask_array.shape == (h, w) and mask_array.any():
+            valid_mask = mask_array.astype(bool)
+        else:
+            valid_mask = np.ones((h, w), dtype=bool)
+
+        k = int(pipeline.get("k", 1)) if bool(pipeline.get("kmeans_enabled", False)) else 1
+        mode_parts: list[str] = []
+        palette = np.array(
+            [
+                [31, 119, 180],
+                [255, 127, 14],
+                [44, 160, 44],
+                [214, 39, 40],
+                [148, 103, 189],
+                [140, 86, 75],
+                [227, 119, 194],
+                [127, 127, 127],
+            ],
+            dtype=np.uint8,
+        )
+        clustered = np.zeros((h, w, 3), dtype=np.uint8)
+        if k > 1:
+            labels_2d, _centers, counts, kmeans_ms = self.kmeans_labels_for_filter(adjusted, valid_mask, k)
+            for cluster_id in range(min(len(counts), len(palette))):
+                clustered[(labels_2d == cluster_id) & valid_mask] = palette[cluster_id]
+            candidate, cluster_text = self.select_kmeans_candidate(
+                labels_2d,
+                valid_mask,
+                counts,
+                str(pipeline.get("cluster_select", "all")),
+            )
+            if str(pipeline.get("cluster_select", "all")) != "all":
+                selected_overlay = candidate & valid_mask
+                clustered[selected_overlay] = np.clip(
+                    clustered[selected_overlay].astype(np.float32) * 0.45 + np.array([255, 255, 255]) * 0.55,
+                    0,
+                    255,
+                ).astype(np.uint8)
+            mode_parts.append(f"kmeans={kmeans_ms:.1f}ms")
+            mode_parts.append(cluster_text)
+        else:
+            candidate = valid_mask.copy()
+            counts = np.asarray([int(valid_mask.sum())], dtype=np.int64)
+            clustered[valid_mask] = adjusted[valid_mask]
+            mode_parts.append("kmeans=off")
+            mode_parts.append("cluster=all")
+
+        raw_area = int(candidate.sum())
+        work_mask = candidate
+        failed = False
+        order = str(pipeline.get("post_order", "jbf_then_refine"))
+        if order == "refine_then_jbf":
+            work_mask, refine_mode = self.apply_filter_refinement(work_mask, valid_mask, pipeline)
+            mode_parts.append(refine_mode)
+            work_mask, jbf_mode, failed = self.apply_filter_jbf(work_mask, adjusted, valid_mask, pipeline)
+            mode_parts.append(jbf_mode)
+        else:
+            work_mask, jbf_mode, failed = self.apply_filter_jbf(work_mask, adjusted, valid_mask, pipeline)
+            mode_parts.append(jbf_mode)
+            work_mask, refine_mode = self.apply_filter_refinement(work_mask, valid_mask, pipeline)
+            mode_parts.append(refine_mode)
+
+        refined = np.zeros((h, w, 3), dtype=np.uint8)
+        if failed:
+            refined[candidate] = np.array([214, 39, 40], dtype=np.uint8)
+        else:
+            refined[work_mask] = np.array([44, 160, 44], dtype=np.uint8)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        alive_area = int(work_mask.sum()) if not failed else 0
+        stats_text = (
+            f"order={order}, raw_area={raw_area}, alive_area={alive_area}, "
+            f"status={'unknown' if failed else ('alive' if alive_area > 0 else 'dead')}, "
+            f"elapsed={elapsed_ms:.1f}ms | {' | '.join(mode_parts)}"
+        )
+        return adjusted, clustered, refined, stats_text
 
     def evaluate_main_filter_row(self, row: pd.Series, pipeline: dict[str, object], params_key: tuple[object, ...]) -> dict[str, object]:
         row_id = int(row.get("row_id"))

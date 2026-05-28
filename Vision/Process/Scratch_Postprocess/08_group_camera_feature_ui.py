@@ -18,6 +18,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 from collections import OrderedDict
+from copy import deepcopy
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -66,7 +67,7 @@ DEFECT_COLORS = {
     "기타": "#4c78a8",
 }
 
-MAIN_JBF_CACHE_VERSION = "main_jbf_v3_opencv"
+MAIN_FILTER_CACHE_VERSION = "main_filter_v1"
 OPENCV_JBF_INSTALL_HINT = "OpenCV Joint Bilateral Filter는 opencv-contrib-python의 cv2.ximgproc가 필요합니다."
 
 KOREAN_FONT_CANDIDATES = [
@@ -1736,15 +1737,16 @@ class GroupCameraFeatureExplorer:
         self.custom_terms: list[dict[str, object]] = []
         self.custom_metric_counter = 1
         self.artist_rows: dict[object, list[int]] = {}
-        self.main_jbf_results: dict[int, dict[str, object]] = {}
-        self.main_jbf_cache: OrderedDict[tuple[object, ...], dict[str, object]] = OrderedDict()
-        self.main_jbf_image_cache: OrderedDict[tuple[object, ...], np.ndarray | None] = OrderedDict()
-        self.main_jbf_mask_cache: OrderedDict[tuple[object, ...], np.ndarray | None] = OrderedDict()
-        self.main_jbf_result_cache_limit = 20000
-        self.main_jbf_image_cache_limit = 96
-        self.main_jbf_mask_cache_limit = 512
-        self.main_jbf_scope_text = ""
-        self.jbf_rate_ax = None
+        self.main_filter_results: dict[int, dict[str, object]] = {}
+        self.main_filter_cache: OrderedDict[tuple[object, ...], dict[str, object]] = OrderedDict()
+        self.main_filter_image_cache: OrderedDict[tuple[object, ...], np.ndarray | None] = OrderedDict()
+        self.main_filter_mask_cache: OrderedDict[tuple[object, ...], np.ndarray | None] = OrderedDict()
+        self.main_filter_result_cache_limit = 20000
+        self.main_filter_image_cache_limit = 96
+        self.main_filter_mask_cache_limit = 512
+        self.main_filter_scope_text = ""
+        self.filter_rate_ax = None
+        self.filter_pipelines: list[dict[str, object]] = [self.default_filter_pipeline()]
         self.image_viewer = ImageViewer(root)
 
         self.csv_path_var = tk.StringVar(value=str(csv_path) if csv_path else "")
@@ -1760,18 +1762,12 @@ class GroupCameraFeatureExplorer:
         self.formula_text_var = tk.StringVar(value="항을 추가하세요.")
         self.threshold_var = tk.StringVar()
         self.threshold_direction_var = tk.StringVar(value="상단 제거 (>=)")
-        self.main_jbf_enable_var = tk.BooleanVar(value=False)
-        self.main_jbf_diameter_var = tk.IntVar(value=15)
-        self.main_jbf_sigma_color_var = tk.DoubleVar(value=30.0)
-        self.main_jbf_sigma_space_var = tk.DoubleVar(value=15.0)
-        self.main_jbf_morph_open_var = tk.IntVar(value=3)
-        self.main_jbf_morph_close_var = tk.IntVar(value=5)
-        self.main_jbf_blur_kernel_var = tk.IntVar(value=3)
-        self.main_jbf_threshold_var = tk.DoubleVar(value=230.0)
-        self.main_jbf_sample_size_var = tk.StringVar(value="500")
-        self.main_jbf_seed_var = tk.StringVar(value="17")
-        self.main_jbf_group_balanced_var = tk.BooleanVar(value=False)
-        self.main_jbf_rate_line_var = tk.BooleanVar(value=False)
+        self.main_filter_enable_var = tk.BooleanVar(value=False)
+        self.main_filter_pipeline_var = tk.StringVar(value=str(self.filter_pipelines[0]["name"]))
+        self.main_filter_sample_size_var = tk.StringVar(value="500")
+        self.main_filter_seed_var = tk.StringVar(value="17")
+        self.main_filter_group_balanced_var = tk.BooleanVar(value=False)
+        self.main_filter_rate_line_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="CSV를 로드하세요.")
 
         self._build_layout()
@@ -1797,6 +1793,71 @@ class GroupCameraFeatureExplorer:
                 current_font.configure(family=KOREAN_FONT_FAMILY)
             except tk.TclError:
                 continue
+
+    @staticmethod
+    def default_filter_pipeline(name: str = "OpenCV JBF Default") -> dict[str, object]:
+        return {
+            "name": name,
+            "source": "image_path",
+            "contrast": 1.0,
+            "blur": 0.0,
+            "kmeans_enabled": False,
+            "k": 1,
+            "cluster_select": "all",
+            "post_order": "jbf_then_refine",
+            "refine_enabled": False,
+            "refine_kernel": 3,
+            "refine_kernel_w": 3,
+            "refine_kernel_h": 3,
+            "refine_angle_enabled": False,
+            "refine_open_iter": 1,
+            "refine_close_iter": 1,
+            "refine_min_area": 12,
+            "jbf_enabled": True,
+            "jbf_diameter": 15,
+            "jbf_sigma_color": 30.0,
+            "jbf_sigma_space": 15.0,
+            "jbf_morph_open": 3,
+            "jbf_morph_close": 5,
+            "jbf_blur_kernel": 3,
+            "jbf_threshold": 230.0,
+        }
+
+    def filter_pipeline_names(self) -> list[str]:
+        return [str(pipeline.get("name", "")) for pipeline in self.filter_pipelines]
+
+    def selected_filter_pipeline(self) -> dict[str, object]:
+        selected_name = self.main_filter_pipeline_var.get()
+        for pipeline in self.filter_pipelines:
+            if str(pipeline.get("name", "")) == selected_name:
+                return deepcopy(pipeline)
+        if self.filter_pipelines:
+            fallback = deepcopy(self.filter_pipelines[0])
+            self.main_filter_pipeline_var.set(str(fallback.get("name", "")))
+            return fallback
+        fallback = self.default_filter_pipeline()
+        self.filter_pipelines.append(fallback)
+        self.main_filter_pipeline_var.set(str(fallback["name"]))
+        return deepcopy(fallback)
+
+    def refresh_filter_pipeline_combo(self) -> None:
+        names = self.filter_pipeline_names()
+        if hasattr(self, "main_filter_combo"):
+            self.main_filter_combo["values"] = names
+        if self.main_filter_pipeline_var.get() not in names and names:
+            self.main_filter_pipeline_var.set(names[0])
+        self.clear_main_filter_state(clear_arrays=False)
+        self.refresh_plot()
+
+    @staticmethod
+    def freeze_for_cache(value: object) -> object:
+        if isinstance(value, dict):
+            return tuple((key, GroupCameraFeatureExplorer.freeze_for_cache(value[key])) for key in sorted(value))
+        if isinstance(value, list):
+            return tuple(GroupCameraFeatureExplorer.freeze_for_cache(item) for item in value)
+        if isinstance(value, float):
+            return round(value, 6)
+        return value
 
     def _build_layout(self) -> None:
         top = ttk.Frame(self.root, padding=8)
@@ -1887,107 +1948,45 @@ class GroupCameraFeatureExplorer:
         self.term_listbox.pack(side=tk.LEFT, fill=tk.X, expand=False, padx=(0, 8))
         ttk.Label(formula_bottom, textvariable=self.formula_text_var, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        main_jbf_frame = ttk.LabelFrame(self.root, text="메인 JBF 배치 평가", padding=(8, 6))
-        main_jbf_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
-        main_jbf_top = ttk.Frame(main_jbf_frame)
-        main_jbf_top.pack(side=tk.TOP, fill=tk.X)
-        main_jbf_bottom = ttk.Frame(main_jbf_frame)
-        main_jbf_bottom.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
+        main_filter_frame = ttk.LabelFrame(self.root, text="메인 Filter 배치 평가", padding=(8, 6))
+        main_filter_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+        main_filter_top = ttk.Frame(main_filter_frame)
+        main_filter_top.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Checkbutton(
-            main_jbf_top,
-            text="JBFFilter 표시",
-            variable=self.main_jbf_enable_var,
+            main_filter_top,
+            text="Filter 결과 표시",
+            variable=self.main_filter_enable_var,
             command=self.refresh_plot,
         ).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(main_jbf_top, text="JBF 적용/갱신", command=self.apply_main_jbf_batch).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Label(main_jbf_top, text="Sample rows(0=all)").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Entry(main_jbf_top, textvariable=self.main_jbf_sample_size_var, width=8).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Label(main_jbf_top, text="Seed").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Entry(main_jbf_top, textvariable=self.main_jbf_seed_var, width=8).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Label(main_filter_top, text="Filter").pack(side=tk.LEFT, padx=(0, 4))
+        self.main_filter_combo = ttk.Combobox(
+            main_filter_top,
+            textvariable=self.main_filter_pipeline_var,
+            state="readonly",
+            width=28,
+            values=self.filter_pipeline_names(),
+        )
+        self.main_filter_combo.pack(side=tk.LEFT, padx=(0, 6))
+        self.main_filter_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_plot())
+        ttk.Button(main_filter_top, text="Filter 관리...", command=self.open_filter_manager).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(main_filter_top, text="Filter 적용/갱신", command=self.apply_main_filter_batch).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(main_filter_top, text="Sample rows(0=all)").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Entry(main_filter_top, textvariable=self.main_filter_sample_size_var, width=8).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(main_filter_top, text="Seed").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Entry(main_filter_top, textvariable=self.main_filter_seed_var, width=8).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Checkbutton(
-            main_jbf_top,
+            main_filter_top,
             text="Group 균등 샘플링",
-            variable=self.main_jbf_group_balanced_var,
+            variable=self.main_filter_group_balanced_var,
         ).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Checkbutton(
-            main_jbf_top,
-            text="JBF Alive Checker",
-            variable=self.main_jbf_rate_line_var,
+            main_filter_top,
+            text="Filter Alive Checker",
+            variable=self.main_filter_rate_line_var,
             command=self.refresh_plot,
         ).pack(side=tk.LEFT, padx=(0, 14))
-        ttk.Label(main_jbf_top, text="현재 Group/Camera 필터 대상에서 샘플링 후 Alive/Dead 평가").pack(side=tk.LEFT)
-
-        ttk.Label(main_jbf_bottom, text="Diameter").pack(side=tk.LEFT, padx=(0, 4))
-        tk.Scale(
-            main_jbf_bottom,
-            from_=1,
-            to=31,
-            resolution=2,
-            orient=tk.HORIZONTAL,
-            variable=self.main_jbf_diameter_var,
-            length=105,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(main_jbf_bottom, text="SigmaColor").pack(side=tk.LEFT, padx=(0, 4))
-        tk.Scale(
-            main_jbf_bottom,
-            from_=1.0,
-            to=150.0,
-            resolution=1.0,
-            orient=tk.HORIZONTAL,
-            variable=self.main_jbf_sigma_color_var,
-            length=115,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(main_jbf_bottom, text="SigmaSpace").pack(side=tk.LEFT, padx=(0, 4))
-        tk.Scale(
-            main_jbf_bottom,
-            from_=1.0,
-            to=50.0,
-            resolution=1.0,
-            orient=tk.HORIZONTAL,
-            variable=self.main_jbf_sigma_space_var,
-            length=110,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(main_jbf_bottom, text="MorphOpen").pack(side=tk.LEFT, padx=(0, 4))
-        tk.Scale(
-            main_jbf_bottom,
-            from_=0,
-            to=5,
-            resolution=1,
-            orient=tk.HORIZONTAL,
-            variable=self.main_jbf_morph_open_var,
-            length=80,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(main_jbf_bottom, text="MorphClose").pack(side=tk.LEFT, padx=(0, 4))
-        tk.Scale(
-            main_jbf_bottom,
-            from_=0,
-            to=5,
-            resolution=1,
-            orient=tk.HORIZONTAL,
-            variable=self.main_jbf_morph_close_var,
-            length=80,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(main_jbf_bottom, text="BlurKernel").pack(side=tk.LEFT, padx=(0, 4))
-        tk.Scale(
-            main_jbf_bottom,
-            from_=1,
-            to=31,
-            resolution=2,
-            orient=tk.HORIZONTAL,
-            variable=self.main_jbf_blur_kernel_var,
-            length=95,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(main_jbf_bottom, text="Threshold(0-255)").pack(side=tk.LEFT, padx=(0, 4))
-        tk.Scale(
-            main_jbf_bottom,
-            from_=0.0,
-            to=255.0,
-            resolution=1.0,
-            orient=tk.HORIZONTAL,
-            variable=self.main_jbf_threshold_var,
-            length=115,
-        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(main_filter_top, text="현재 Group/Camera 필터 대상에서 샘플링 후 Alive/Dead 평가").pack(side=tk.LEFT)
 
         main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
@@ -2010,11 +2009,11 @@ class GroupCameraFeatureExplorer:
         ttk.Label(table_frame, text="Group x Camera 평균/분포 요약").pack(side=tk.TOP, anchor="w")
         columns = [
             "group",
-            "jbf_alive",
-            "jbf_dead",
-            "jbf_eval",
-            "jbf_unknown",
-            "jbf_alive_rate",
+            "filter_alive",
+            "filter_dead",
+            "filter_eval",
+            "filter_unknown",
+            "filter_alive_rate",
             "camera_mode",
             "count",
             "mean",
@@ -2064,6 +2063,252 @@ class GroupCameraFeatureExplorer:
         self.status_label = ttk.Label(self.root, textvariable=self.status_var, anchor="w", padding=(8, 2))
         self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
 
+    def open_filter_manager(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Filter Pipeline 관리")
+        window.geometry("980x720")
+        window.transient(self.root)
+
+        outer = ttk.Frame(window, padding=10)
+        outer.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        list_frame = ttk.Frame(outer)
+        list_frame.grid(row=0, column=0, sticky="ns", padx=(0, 12))
+        ttk.Label(list_frame, text="Pipelines").pack(side=tk.TOP, anchor="w")
+        pipeline_list = tk.Listbox(list_frame, height=26, width=28, exportselection=False)
+        pipeline_list.pack(side=tk.TOP, fill=tk.Y, expand=True)
+
+        edit_frame = ttk.Frame(outer)
+        edit_frame.grid(row=0, column=1, sticky="nsew")
+        edit_frame.columnconfigure(1, weight=1)
+
+        vars_map: dict[str, tk.Variable] = {
+            "name": tk.StringVar(),
+            "source": tk.StringVar(),
+            "contrast": tk.DoubleVar(),
+            "blur": tk.DoubleVar(),
+            "kmeans_enabled": tk.BooleanVar(),
+            "k": tk.IntVar(),
+            "cluster_select": tk.StringVar(),
+            "post_order": tk.StringVar(),
+            "refine_enabled": tk.BooleanVar(),
+            "refine_kernel": tk.IntVar(),
+            "refine_kernel_w": tk.IntVar(),
+            "refine_kernel_h": tk.IntVar(),
+            "refine_angle_enabled": tk.BooleanVar(),
+            "refine_open_iter": tk.IntVar(),
+            "refine_close_iter": tk.IntVar(),
+            "refine_min_area": tk.IntVar(),
+            "jbf_enabled": tk.BooleanVar(),
+            "jbf_diameter": tk.IntVar(),
+            "jbf_sigma_color": tk.DoubleVar(),
+            "jbf_sigma_space": tk.DoubleVar(),
+            "jbf_morph_open": tk.IntVar(),
+            "jbf_morph_close": tk.IntVar(),
+            "jbf_blur_kernel": tk.IntVar(),
+            "jbf_threshold": tk.DoubleVar(),
+        }
+
+        def set_vars(pipeline: dict[str, object]) -> None:
+            defaults = self.default_filter_pipeline(str(pipeline.get("name", "Pipeline")))
+            merged = {**defaults, **pipeline}
+            for key, variable in vars_map.items():
+                variable.set(merged.get(key, defaults.get(key, "")))
+
+        def collect_pipeline() -> dict[str, object]:
+            name = str(vars_map["name"].get()).strip() or "Unnamed Filter"
+            return {
+                "name": name,
+                "source": str(vars_map["source"].get() or "image_path"),
+                "contrast": float(vars_map["contrast"].get()),
+                "blur": float(vars_map["blur"].get()),
+                "kmeans_enabled": bool(vars_map["kmeans_enabled"].get()),
+                "k": int(vars_map["k"].get()),
+                "cluster_select": str(vars_map["cluster_select"].get() or "all"),
+                "post_order": str(vars_map["post_order"].get() or "jbf_then_refine"),
+                "refine_enabled": bool(vars_map["refine_enabled"].get()),
+                "refine_kernel": int(vars_map["refine_kernel"].get()),
+                "refine_kernel_w": int(vars_map["refine_kernel_w"].get()),
+                "refine_kernel_h": int(vars_map["refine_kernel_h"].get()),
+                "refine_angle_enabled": bool(vars_map["refine_angle_enabled"].get()),
+                "refine_open_iter": int(vars_map["refine_open_iter"].get()),
+                "refine_close_iter": int(vars_map["refine_close_iter"].get()),
+                "refine_min_area": int(vars_map["refine_min_area"].get()),
+                "jbf_enabled": bool(vars_map["jbf_enabled"].get()),
+                "jbf_diameter": int(vars_map["jbf_diameter"].get()),
+                "jbf_sigma_color": float(vars_map["jbf_sigma_color"].get()),
+                "jbf_sigma_space": float(vars_map["jbf_sigma_space"].get()),
+                "jbf_morph_open": int(vars_map["jbf_morph_open"].get()),
+                "jbf_morph_close": int(vars_map["jbf_morph_close"].get()),
+                "jbf_blur_kernel": int(vars_map["jbf_blur_kernel"].get()),
+                "jbf_threshold": float(vars_map["jbf_threshold"].get()),
+            }
+
+        def unique_name(base: str) -> str:
+            existing = set(self.filter_pipeline_names())
+            if base not in existing:
+                return base
+            idx = 2
+            while f"{base} {idx}" in existing:
+                idx += 1
+            return f"{base} {idx}"
+
+        def selected_index() -> int:
+            selection = pipeline_list.curselection()
+            return int(selection[0]) if selection else -1
+
+        def refresh_list(select_idx: int | None = None) -> None:
+            pipeline_list.delete(0, tk.END)
+            for name in self.filter_pipeline_names():
+                pipeline_list.insert(tk.END, name)
+            if self.filter_pipelines:
+                idx = 0 if select_idx is None else max(0, min(select_idx, len(self.filter_pipelines) - 1))
+                pipeline_list.selection_clear(0, tk.END)
+                pipeline_list.selection_set(idx)
+                pipeline_list.activate(idx)
+                set_vars(self.filter_pipelines[idx])
+
+        def on_select(_event: object | None = None) -> None:
+            idx = selected_index()
+            if 0 <= idx < len(self.filter_pipelines):
+                set_vars(self.filter_pipelines[idx])
+
+        def add_pipeline() -> None:
+            pipeline = self.default_filter_pipeline(unique_name("KMeans Filter"))
+            pipeline["kmeans_enabled"] = True
+            pipeline["k"] = 2
+            pipeline["cluster_select"] = "darkest"
+            pipeline["refine_enabled"] = True
+            self.filter_pipelines.append(pipeline)
+            refresh_list(len(self.filter_pipelines) - 1)
+
+        def copy_pipeline() -> None:
+            idx = selected_index()
+            if idx < 0:
+                return
+            pipeline = deepcopy(self.filter_pipelines[idx])
+            pipeline["name"] = unique_name(f"{pipeline.get('name', 'Pipeline')} Copy")
+            self.filter_pipelines.append(pipeline)
+            refresh_list(len(self.filter_pipelines) - 1)
+
+        def save_pipeline() -> None:
+            idx = selected_index()
+            pipeline = collect_pipeline()
+            names = self.filter_pipeline_names()
+            if any(name == pipeline["name"] and pos != idx for pos, name in enumerate(names)):
+                messagebox.showwarning("이름 중복", "같은 이름의 Filter Pipeline이 이미 있습니다.")
+                return
+            if idx < 0:
+                self.filter_pipelines.append(pipeline)
+                idx = len(self.filter_pipelines) - 1
+            else:
+                self.filter_pipelines[idx] = pipeline
+            self.main_filter_pipeline_var.set(str(pipeline["name"]))
+            self.refresh_filter_pipeline_combo()
+            refresh_list(idx)
+
+        def delete_pipeline() -> None:
+            idx = selected_index()
+            if idx < 0:
+                return
+            if len(self.filter_pipelines) <= 1:
+                messagebox.showwarning("삭제 불가", "최소 1개의 Filter Pipeline은 필요합니다.")
+                return
+            del self.filter_pipelines[idx]
+            self.refresh_filter_pipeline_combo()
+            refresh_list(max(0, idx - 1))
+
+        pipeline_list.bind("<<ListboxSelect>>", on_select)
+
+        row = 0
+        ttk.Label(edit_frame, text="Name").grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Entry(edit_frame, textvariable=vars_map["name"], width=34).grid(row=row, column=1, sticky="ew", pady=3)
+        row += 1
+        ttk.Label(edit_frame, text="Source").grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Combobox(
+            edit_frame,
+            textvariable=vars_map["source"],
+            state="readonly",
+            values=["image_path", "mask_raw_path"],
+            width=20,
+        ).grid(row=row, column=1, sticky="w", pady=3)
+        row += 1
+
+        prep = ttk.LabelFrame(edit_frame, text="Preprocess", padding=(8, 6))
+        prep.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        row += 1
+        ttk.Label(prep, text="Contrast").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Scale(prep, from_=0.2, to=4.0, resolution=0.05, orient=tk.HORIZONTAL, variable=vars_map["contrast"], length=180).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(prep, text="Gaussian Blur").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Scale(prep, from_=0.0, to=5.0, resolution=0.1, orient=tk.HORIZONTAL, variable=vars_map["blur"], length=180).pack(side=tk.LEFT, padx=(0, 12))
+
+        kmeans = ttk.LabelFrame(edit_frame, text="K-Means Layer", padding=(8, 6))
+        kmeans.grid(row=row, column=0, columnspan=2, sticky="ew", pady=4)
+        row += 1
+        ttk.Checkbutton(kmeans, text="Use K-Means", variable=vars_map["kmeans_enabled"]).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(kmeans, text="K").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Scale(kmeans, from_=1, to=8, resolution=1, orient=tk.HORIZONTAL, variable=vars_map["k"], length=120).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(kmeans, text="Cluster").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Combobox(
+            kmeans,
+            textvariable=vars_map["cluster_select"],
+            state="readonly",
+            values=["all", "darkest", "brightest", "largest", "smallest"],
+            width=12,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(kmeans, text="Order").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Combobox(
+            kmeans,
+            textvariable=vars_map["post_order"],
+            state="readonly",
+            values=["jbf_then_refine", "refine_then_jbf"],
+            width=16,
+        ).pack(side=tk.LEFT)
+
+        refine = ttk.LabelFrame(edit_frame, text="Refinement Layer", padding=(8, 6))
+        refine.grid(row=row, column=0, columnspan=2, sticky="ew", pady=4)
+        row += 1
+        ttk.Checkbutton(refine, text="Use Refinement", variable=vars_map["refine_enabled"]).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(refine, text="Angle", variable=vars_map["refine_angle_enabled"]).pack(side=tk.LEFT, padx=(0, 10))
+        for label, key, max_value in [
+            ("Kernel", "refine_kernel", 15),
+            ("W", "refine_kernel_w", 31),
+            ("H", "refine_kernel_h", 31),
+            ("Open", "refine_open_iter", 5),
+            ("Close", "refine_close_iter", 5),
+            ("MinArea", "refine_min_area", 500),
+        ]:
+            ttk.Label(refine, text=label).pack(side=tk.LEFT, padx=(0, 3))
+            tk.Scale(refine, from_=0 if key in {"refine_open_iter", "refine_close_iter", "refine_min_area"} else 1, to=max_value, resolution=1, orient=tk.HORIZONTAL, variable=vars_map[key], length=80).pack(side=tk.LEFT, padx=(0, 6))
+
+        jbf = ttk.LabelFrame(edit_frame, text="OpenCV JBF Layer", padding=(8, 6))
+        jbf.grid(row=row, column=0, columnspan=2, sticky="ew", pady=4)
+        row += 1
+        ttk.Checkbutton(jbf, text="Use JBF", variable=vars_map["jbf_enabled"]).pack(side=tk.LEFT, padx=(0, 10))
+        for label, key, max_value, resolution in [
+            ("D", "jbf_diameter", 31, 2),
+            ("SC", "jbf_sigma_color", 150, 1),
+            ("SS", "jbf_sigma_space", 50, 1),
+            ("MO", "jbf_morph_open", 5, 1),
+            ("MC", "jbf_morph_close", 5, 1),
+            ("Blur", "jbf_blur_kernel", 31, 2),
+            ("Th", "jbf_threshold", 255, 1),
+        ]:
+            ttk.Label(jbf, text=label).pack(side=tk.LEFT, padx=(0, 3))
+            tk.Scale(jbf, from_=0 if key in {"jbf_morph_open", "jbf_morph_close", "jbf_threshold"} else 1, to=max_value, resolution=resolution, orient=tk.HORIZONTAL, variable=vars_map[key], length=80).pack(side=tk.LEFT, padx=(0, 6))
+
+        button_row = ttk.Frame(outer)
+        button_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Button(button_row, text="새 Pipeline", command=add_pipeline).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(button_row, text="복사", command=copy_pipeline).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(button_row, text="저장", command=save_pipeline).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(button_row, text="삭제", command=delete_pipeline).pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Button(button_row, text="닫기", command=window.destroy).pack(side=tk.RIGHT)
+
+        refresh_list(0)
+
     def choose_csv(self) -> None:
         initial = str(self.csv_path.parent) if self.csv_path else str(Path.cwd())
         selected = filedialog.askopenfilename(
@@ -2081,7 +2326,7 @@ class GroupCameraFeatureExplorer:
             self.image_root = Path(selected)
             self.image_root_var.set(str(self.image_root))
             self.image_search_cache.clear()
-            self.clear_main_jbf_state(clear_arrays=True)
+            self.clear_main_filter_state(clear_arrays=True)
             self.status_var.set(f"이미지 루트 설정: {self.image_root}")
 
     def add_formula_term(self) -> None:
@@ -2226,7 +2471,7 @@ class GroupCameraFeatureExplorer:
         self.csv_dir = path.parent
         self.csv_path_var.set(str(path))
         self.image_search_cache.clear()
-        self.clear_main_jbf_state(clear_arrays=True)
+        self.clear_main_filter_state(clear_arrays=True)
         self.df = self._prepare_dataframe(df)
         self.numeric_features = self._numeric_feature_columns(self.df)
         self.custom_terms.clear()
@@ -2361,35 +2606,16 @@ class GroupCameraFeatureExplorer:
             return default
         return max(value, minimum)
 
-    def main_jbf_params_tuple(self) -> tuple[object, ...]:
-        return (
-            int(self.main_jbf_diameter_var.get()),
-            round(float(self.main_jbf_sigma_color_var.get()), 4),
-            round(float(self.main_jbf_sigma_space_var.get()), 4),
-            int(self.main_jbf_morph_open_var.get()),
-            int(self.main_jbf_morph_close_var.get()),
-            int(self.main_jbf_blur_kernel_var.get()),
-            round(float(self.main_jbf_threshold_var.get()), 4),
-        )
+    def main_filter_params_tuple(self, pipeline: dict[str, object]) -> tuple[object, ...]:
+        return (MAIN_FILTER_CACHE_VERSION, self.freeze_for_cache(pipeline))
 
-    def main_jbf_params_dict(self) -> dict[str, object]:
-        return {
-            "diameter": int(self.main_jbf_diameter_var.get()),
-            "sigma_color": float(self.main_jbf_sigma_color_var.get()),
-            "sigma_space": float(self.main_jbf_sigma_space_var.get()),
-            "morph_open": int(self.main_jbf_morph_open_var.get()),
-            "morph_close": int(self.main_jbf_morph_close_var.get()),
-            "blur_kernel": int(self.main_jbf_blur_kernel_var.get()),
-            "threshold": float(self.main_jbf_threshold_var.get()),
-        }
-
-    def clear_main_jbf_state(self, clear_arrays: bool = False) -> None:
-        self.main_jbf_results.clear()
-        self.main_jbf_cache.clear()
-        self.main_jbf_scope_text = ""
+    def clear_main_filter_state(self, clear_arrays: bool = False) -> None:
+        self.main_filter_results.clear()
+        self.main_filter_cache.clear()
+        self.main_filter_scope_text = ""
         if clear_arrays:
-            self.main_jbf_image_cache.clear()
-            self.main_jbf_mask_cache.clear()
+            self.main_filter_image_cache.clear()
+            self.main_filter_mask_cache.clear()
 
     @staticmethod
     def lru_get(cache: OrderedDict[tuple[object, ...], object], key: tuple[object, ...]) -> tuple[bool, object]:
@@ -2412,7 +2638,7 @@ class GroupCameraFeatureExplorer:
             cache.popitem(last=False)
 
     @staticmethod
-    def main_jbf_file_token(path: Path | None) -> tuple[object, ...]:
+    def main_filter_file_token(path: Path | None) -> tuple[object, ...]:
         if path is None:
             return ("missing",)
         try:
@@ -2425,7 +2651,7 @@ class GroupCameraFeatureExplorer:
             return ("not_found", resolved)
         return ("file", resolved, int(stat.st_size), int(stat.st_mtime_ns))
 
-    def cached_main_jbf_rgb_array(
+    def cached_main_filter_rgb_array(
         self,
         path: Path | None,
         expected_shape: tuple[int, int] | None,
@@ -2433,55 +2659,202 @@ class GroupCameraFeatureExplorer:
     ) -> np.ndarray | None:
         shape_key = tuple(expected_shape) if expected_shape is not None else None
         key = ("rgb", file_token, shape_key)
-        hit, value = self.lru_get(self.main_jbf_image_cache, key)
+        hit, value = self.lru_get(self.main_filter_image_cache, key)
         if hit:
             return value  # type: ignore[return-value]
         value = ImageViewer.load_rgb_array(path, expected_shape)
-        self.lru_put(self.main_jbf_image_cache, key, value, self.main_jbf_image_cache_limit)
+        self.lru_put(self.main_filter_image_cache, key, value, self.main_filter_image_cache_limit)
         return value
 
-    def cached_main_jbf_mask_array(
+    def cached_main_filter_mask_array(
         self,
         path: Path | None,
         expected_shape: tuple[int, int],
         file_token: tuple[object, ...],
     ) -> np.ndarray | None:
         key = ("mask", file_token, tuple(expected_shape))
-        hit, value = self.lru_get(self.main_jbf_mask_cache, key)
+        hit, value = self.lru_get(self.main_filter_mask_cache, key)
         if hit:
             return value  # type: ignore[return-value]
         value = ImageViewer.load_mask_array(path, expected_shape)
-        self.lru_put(self.main_jbf_mask_cache, key, value, self.main_jbf_mask_cache_limit)
+        self.lru_put(self.main_filter_mask_cache, key, value, self.main_filter_mask_cache_limit)
         return value
 
-    def get_main_jbf_result_cache(self, key: tuple[object, ...]) -> dict[str, object] | None:
-        hit, value = self.lru_get(self.main_jbf_cache, key)
+    def get_main_filter_result_cache(self, key: tuple[object, ...]) -> dict[str, object] | None:
+        hit, value = self.lru_get(self.main_filter_cache, key)
         if not hit:
             return None
         cached = dict(value)  # type: ignore[arg-type]
         cached["cache_hit"] = True
         return cached
 
-    def set_main_jbf_result_cache(self, key: tuple[object, ...], result: dict[str, object]) -> None:
+    def set_main_filter_result_cache(self, key: tuple[object, ...], result: dict[str, object]) -> None:
         stored = dict(result)
         stored["cache_hit"] = False
-        self.lru_put(self.main_jbf_cache, key, stored, self.main_jbf_result_cache_limit)
+        self.lru_put(self.main_filter_cache, key, stored, self.main_filter_result_cache_limit)
 
-    def evaluate_main_jbf_row(self, row: pd.Series, params: dict[str, object], params_key: tuple[object, ...]) -> dict[str, object]:
+    @staticmethod
+    def kmeans_labels_for_filter(
+        array: np.ndarray,
+        valid_mask: np.ndarray,
+        k: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        start = time.perf_counter()
+        k = int(np.clip(k, 1, 8))
+        h, w, _ = array.shape
+        labels_2d = np.full((h, w), -1, dtype=np.int16)
+        pixels = array[valid_mask].reshape(-1, 3).astype(np.float32)
+        if len(pixels) <= 0:
+            return labels_2d, np.zeros((k, 3), dtype=np.float32), np.zeros(k, dtype=np.int64), 0.0
+
+        if k <= 1:
+            ordered_labels = np.zeros(len(pixels), dtype=np.int16)
+            ordered_centers = pixels.mean(axis=0, keepdims=True).astype(np.float32)
+        else:
+            rng = np.random.default_rng(17)
+            sample_size = min(25000, len(pixels))
+            sample_idx = rng.choice(len(pixels), size=sample_size, replace=False)
+            sample = pixels[sample_idx]
+            luma = sample @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+            centers = []
+            for q in np.linspace(0.05, 0.95, k):
+                target = np.quantile(luma, q)
+                centers.append(sample[int(np.argmin(np.abs(luma - target)))])
+            centers = np.asarray(centers, dtype=np.float32)
+
+            for _ in range(14):
+                distances = ((sample[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+                labels = distances.argmin(axis=1)
+                new_centers = centers.copy()
+                for cluster_id in range(k):
+                    cluster_pixels = sample[labels == cluster_id]
+                    if len(cluster_pixels):
+                        new_centers[cluster_id] = cluster_pixels.mean(axis=0)
+                    else:
+                        new_centers[cluster_id] = sample[rng.integers(0, len(sample))]
+                if np.allclose(new_centers, centers, atol=0.5):
+                    centers = new_centers
+                    break
+                centers = new_centers
+
+            all_labels = np.empty(len(pixels), dtype=np.int16)
+            chunk = 100000
+            for chunk_start in range(0, len(pixels), chunk):
+                chunk_stop = min(chunk_start + chunk, len(pixels))
+                distances = ((pixels[chunk_start:chunk_stop, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+                all_labels[chunk_start:chunk_stop] = distances.argmin(axis=1)
+
+            center_luma = centers @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+            order = np.argsort(center_luma)
+            remap = np.zeros(k, dtype=np.int16)
+            for new_id, old_id in enumerate(order):
+                remap[old_id] = new_id
+            ordered_labels = remap[all_labels]
+            ordered_centers = centers[order]
+
+        labels_2d[valid_mask] = ordered_labels
+        counts = np.bincount(ordered_labels, minlength=len(ordered_centers))
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        return labels_2d, ordered_centers, counts, elapsed_ms
+
+    @staticmethod
+    def select_kmeans_candidate(
+        labels_2d: np.ndarray,
+        valid_mask: np.ndarray,
+        counts: np.ndarray,
+        cluster_select: str,
+    ) -> tuple[np.ndarray, str]:
+        if counts.size <= 0:
+            return np.zeros_like(valid_mask, dtype=bool), "cluster=none"
+        select = str(cluster_select or "all")
+        nonzero = np.where(counts > 0)[0]
+        if select == "darkest":
+            selected = [0]
+        elif select == "brightest":
+            selected = [int(len(counts) - 1)]
+        elif select == "largest":
+            selected = [int(np.argmax(counts))]
+        elif select == "smallest":
+            selected = [int(nonzero[np.argmin(counts[nonzero])])] if len(nonzero) else [0]
+        else:
+            selected = list(range(len(counts)))
+            select = "all"
+        candidate = np.isin(labels_2d, selected) & valid_mask
+        return candidate, f"cluster={select}:{','.join(str(idx) for idx in selected)}"
+
+    @staticmethod
+    def apply_filter_refinement(mask: np.ndarray, angle_mask: np.ndarray, pipeline: dict[str, object]) -> tuple[np.ndarray, str]:
+        if not bool(pipeline.get("refine_enabled", False)):
+            return mask.astype(bool), "refine=off"
+        if bool(pipeline.get("refine_angle_enabled", False)):
+            clean, component_count = ImageViewer.morphology_clean_angle_aligned(
+                mask,
+                angle_mask=angle_mask,
+                kernel_size=int(pipeline.get("refine_kernel", 3)),
+                kernel_w=int(pipeline.get("refine_kernel_w", 3)),
+                kernel_h=int(pipeline.get("refine_kernel_h", 3)),
+                open_iter=int(pipeline.get("refine_open_iter", 1)),
+                close_iter=int(pipeline.get("refine_close_iter", 1)),
+            )
+            mode = f"refine=angle({component_count})"
+        else:
+            clean = ImageViewer.morphology_clean(
+                mask,
+                kernel_size=int(pipeline.get("refine_kernel", 3)),
+                kernel_w=int(pipeline.get("refine_kernel_w", 3)),
+                kernel_h=int(pipeline.get("refine_kernel_h", 3)),
+                open_iter=int(pipeline.get("refine_open_iter", 1)),
+                close_iter=int(pipeline.get("refine_close_iter", 1)),
+            )
+            mode = "refine=axis"
+        clean = ImageViewer.remove_small_components(clean, min_area=int(pipeline.get("refine_min_area", 12)))
+        return clean, mode
+
+    @staticmethod
+    def apply_filter_jbf(
+        mask: np.ndarray,
+        guide: np.ndarray,
+        valid_mask: np.ndarray,
+        pipeline: dict[str, object],
+    ) -> tuple[np.ndarray, str, bool]:
+        if not bool(pipeline.get("jbf_enabled", False)):
+            return mask.astype(bool), "jbf=off", False
+        refined_mask, _elapsed_ms, mode = ImageViewer.jbf_refine_mask(
+            mask,
+            guide_array=guide,
+            valid_mask=valid_mask,
+            diameter=int(pipeline.get("jbf_diameter", 15)),
+            sigma_color=float(pipeline.get("jbf_sigma_color", 30.0)),
+            sigma_space=float(pipeline.get("jbf_sigma_space", 15.0)),
+            morph_open=int(pipeline.get("jbf_morph_open", 3)),
+            morph_close=int(pipeline.get("jbf_morph_close", 5)),
+            blur_kernel=int(pipeline.get("jbf_blur_kernel", 3)),
+            threshold=float(pipeline.get("jbf_threshold", 230.0)),
+            require_opencv_jbf=True,
+        )
+        failed = mode in {"opencv-jbf-unavailable", "opencv-jbf-error"}
+        return refined_mask, f"jbf={mode}", failed
+
+    def evaluate_main_filter_row(self, row: pd.Series, pipeline: dict[str, object], params_key: tuple[object, ...]) -> dict[str, object]:
         row_id = int(row.get("row_id"))
-        image_path = self.resolve_image_path(row.get("image_path")) if "image_path" in row.index else None
-        if image_path is None and "mask_raw_path" in row.index:
-            image_path = self.resolve_image_path(row.get("mask_raw_path"))
+        source_name = str(pipeline.get("source", "image_path"))
+        source_path = self.resolve_image_path(row.get(source_name)) if source_name in row.index else None
+        if source_path is None and "image_path" in row.index:
+            source_path = self.resolve_image_path(row.get("image_path"))
+        if source_path is None and "mask_raw_path" in row.index:
+            source_path = self.resolve_image_path(row.get("mask_raw_path"))
         mask_path = self.resolve_image_path(row.get("mask_path")) if "mask_path" in row.index else None
-        image_token = self.main_jbf_file_token(image_path)
-        mask_token = self.main_jbf_file_token(mask_path)
-        cache_key = (MAIN_JBF_CACHE_VERSION, row_id, image_token, mask_token, params_key)
-        cached_result = self.get_main_jbf_result_cache(cache_key)
+        source_token = self.main_filter_file_token(source_path)
+        mask_token = self.main_filter_file_token(mask_path)
+        cache_key = (MAIN_FILTER_CACHE_VERSION, row_id, source_token, mask_token, params_key)
+        cached_result = self.get_main_filter_result_cache(cache_key)
         if cached_result is not None:
             return cached_result
 
-        if image_path is None or mask_path is None:
+        filter_name = str(pipeline.get("name", "Filter"))
+        if source_path is None or mask_path is None:
             result = {
+                "filter_name": filter_name,
                 "status": "unknown",
                 "raw_area": 0,
                 "alive_area": 0,
@@ -2489,19 +2862,22 @@ class GroupCameraFeatureExplorer:
                 "mode": "missing_path",
                 "cache_hit": False,
             }
-            self.set_main_jbf_result_cache(cache_key, result)
+            self.set_main_filter_result_cache(cache_key, result)
             return result
 
+        start = time.perf_counter()
         try:
-            guide = self.cached_main_jbf_rgb_array(image_path, None, image_token)
+            guide = self.cached_main_filter_rgb_array(source_path, None, source_token)
             if guide is None:
-                raise FileNotFoundError(str(image_path))
-            mask = self.cached_main_jbf_mask_array(mask_path, guide.shape[:2], mask_token)
+                raise FileNotFoundError(str(source_path))
+            mask = self.cached_main_filter_mask_array(mask_path, guide.shape[:2], mask_token)
             if mask is None:
                 raise FileNotFoundError(str(mask_path))
-            raw_area = int(mask.sum())
-            if raw_area <= 0:
+            mask = mask.astype(bool)
+            mask_area = int(mask.sum())
+            if mask_area <= 0:
                 result = {
+                    "filter_name": filter_name,
                     "status": "dead",
                     "raw_area": 0,
                     "alive_area": 0,
@@ -2510,40 +2886,54 @@ class GroupCameraFeatureExplorer:
                     "cache_hit": False,
                 }
             else:
-                refined_mask, elapsed_ms, mode = ImageViewer.jbf_refine_mask(
-                    mask,
-                    guide_array=guide,
-                    valid_mask=mask,
-                    diameter=int(params["diameter"]),
-                    sigma_color=float(params["sigma_color"]),
-                    sigma_space=float(params["sigma_space"]),
-                    morph_open=int(params["morph_open"]),
-                    morph_close=int(params["morph_close"]),
-                    blur_kernel=int(params["blur_kernel"]),
-                    threshold=float(params["threshold"]),
-                    require_opencv_jbf=True,
+                adjusted = ImageViewer.apply_blur(
+                    ImageViewer.apply_contrast(guide, float(pipeline.get("contrast", 1.0))),
+                    float(pipeline.get("blur", 0.0)),
                 )
-                alive_area = int(refined_mask.sum())
-                if mode in {"opencv-jbf-unavailable", "opencv-jbf-error"}:
-                    result = {
-                        "status": "unknown",
-                        "raw_area": raw_area,
-                        "alive_area": 0,
-                        "elapsed_ms": float(elapsed_ms),
-                        "mode": mode,
-                        "cache_hit": False,
-                    }
+                mode_parts = [f"source={source_name}"]
+                if bool(pipeline.get("kmeans_enabled", False)) and int(pipeline.get("k", 1)) > 1:
+                    labels_2d, _centers, counts, kmeans_ms = self.kmeans_labels_for_filter(adjusted, mask, int(pipeline.get("k", 2)))
+                    candidate, cluster_text = self.select_kmeans_candidate(
+                        labels_2d,
+                        mask,
+                        counts,
+                        str(pipeline.get("cluster_select", "all")),
+                    )
+                    mode_parts.append(f"kmeans={kmeans_ms:.1f}ms")
+                    mode_parts.append(cluster_text)
                 else:
-                    result = {
-                        "status": "alive" if alive_area > 0 else "dead",
-                        "raw_area": raw_area,
-                        "alive_area": alive_area,
-                        "elapsed_ms": float(elapsed_ms),
-                        "mode": mode,
-                        "cache_hit": False,
-                    }
+                    candidate = mask.copy()
+                    mode_parts.append("kmeans=off")
+
+                raw_area = int(candidate.sum())
+                work_mask = candidate
+                failed = False
+                order = str(pipeline.get("post_order", "jbf_then_refine"))
+                if order == "refine_then_jbf":
+                    work_mask, refine_mode = self.apply_filter_refinement(work_mask, mask, pipeline)
+                    mode_parts.append(refine_mode)
+                    work_mask, jbf_mode, failed = self.apply_filter_jbf(work_mask, adjusted, mask, pipeline)
+                    mode_parts.append(jbf_mode)
+                else:
+                    work_mask, jbf_mode, failed = self.apply_filter_jbf(work_mask, adjusted, mask, pipeline)
+                    mode_parts.append(jbf_mode)
+                    work_mask, refine_mode = self.apply_filter_refinement(work_mask, mask, pipeline)
+                    mode_parts.append(refine_mode)
+
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                alive_area = int(work_mask.sum())
+                result = {
+                    "filter_name": filter_name,
+                    "status": "unknown" if failed else ("alive" if alive_area > 0 else "dead"),
+                    "raw_area": raw_area,
+                    "alive_area": 0 if failed else alive_area,
+                    "elapsed_ms": float(elapsed_ms),
+                    "mode": " | ".join(mode_parts),
+                    "cache_hit": False,
+                }
         except Exception as exc:  # noqa: BLE001 - batch evaluation should continue per row
             result = {
+                "filter_name": filter_name,
                 "status": "unknown",
                 "raw_area": 0,
                 "alive_area": 0,
@@ -2552,7 +2942,7 @@ class GroupCameraFeatureExplorer:
                 "cache_hit": False,
             }
 
-        self.set_main_jbf_result_cache(cache_key, result)
+        self.set_main_filter_result_cache(cache_key, result)
         return result
 
     @staticmethod
@@ -2603,71 +2993,72 @@ class GroupCameraFeatureExplorer:
         sampled = pd.concat(sampled_parts, axis=0)
         return sampled.sample(frac=1.0, random_state=seed)
 
-    def apply_main_jbf_batch(self) -> None:
+    def apply_main_filter_batch(self) -> None:
         if self.df.empty:
             messagebox.showwarning("CSV 필요", "먼저 CSV를 로드하세요.")
             return
         if "mask_path" not in self.df.columns:
             messagebox.showwarning("mask_path 필요", "CSV에 mask_path 컬럼이 필요합니다.")
             return
-        if not ImageViewer.has_opencv_joint_bilateral_filter():
+        pipeline = self.selected_filter_pipeline()
+        if bool(pipeline.get("jbf_enabled", False)) and not ImageViewer.has_opencv_joint_bilateral_filter():
             install_text = f"{OPENCV_JBF_INSTALL_HINT}\n\n설치 예: python -m pip install opencv-contrib-python"
             messagebox.showwarning("OpenCV JBF 필요", install_text)
-            self.status_var.set("JBF 평가 중단: opencv-contrib-python/cv2.ximgproc가 필요합니다.")
+            self.status_var.set("Filter 평가 중단: opencv-contrib-python/cv2.ximgproc가 필요합니다.")
             return
 
         work = self.filtered().copy()
         if work.empty:
-            self.status_var.set("JBF 평가 대상 row가 없습니다.")
+            self.status_var.set("Filter 평가 대상 row가 없습니다.")
             return
 
         candidate_count = len(work)
-        sample_size = self.parse_int_text(self.main_jbf_sample_size_var.get(), default=500, minimum=0)
-        seed = self.parse_int_text(self.main_jbf_seed_var.get(), default=17, minimum=0)
+        sample_size = self.parse_int_text(self.main_filter_sample_size_var.get(), default=500, minimum=0)
+        seed = self.parse_int_text(self.main_filter_seed_var.get(), default=17, minimum=0)
         if sample_size > 0 and len(work) > sample_size:
-            if self.main_jbf_group_balanced_var.get():
+            if self.main_filter_group_balanced_var.get():
                 work = self.group_balanced_sample(work, sample_size=sample_size, seed=seed)
                 sampled_text = f"sampled={len(work)}/{candidate_count}, seed={seed}, group-balanced"
             else:
                 work = work.sample(n=sample_size, random_state=seed)
                 sampled_text = f"sampled={sample_size}/{candidate_count}, seed={seed}, random"
         else:
-            mode_text = "group-balanced" if self.main_jbf_group_balanced_var.get() else "random"
+            mode_text = "group-balanced" if self.main_filter_group_balanced_var.get() else "random"
             sampled_text = f"sampled=all({len(work)}), seed={seed}, {mode_text}"
 
-        params_key = self.main_jbf_params_tuple()
-        params = self.main_jbf_params_dict()
-        self.main_jbf_results.clear()
-        self.main_jbf_scope_text = sampled_text
+        params_key = self.main_filter_params_tuple(pipeline)
+        filter_name = str(pipeline.get("name", "Filter"))
+        self.main_filter_results.clear()
+        self.main_filter_scope_text = f"{sampled_text}, filter={filter_name}"
         start = time.perf_counter()
         total = len(work)
         cache_hits = 0
         for index, (_idx, row) in enumerate(work.iterrows(), start=1):
             row_id = int(row.get("row_id"))
-            result = self.evaluate_main_jbf_row(row, params, params_key)
+            result = self.evaluate_main_filter_row(row, pipeline, params_key)
             cache_hits += int(bool(result.get("cache_hit", False)))
-            self.main_jbf_results[row_id] = result
+            self.main_filter_results[row_id] = result
             if index == 1 or index % 10 == 0 or index == total:
-                self.status_var.set(f"JBF 평가 중 {index}/{total} | {sampled_text}")
+                self.status_var.set(f"Filter 평가 중 {index}/{total} | {sampled_text} | {filter_name}")
                 self.root.update_idletasks()
 
         elapsed_ms = (time.perf_counter() - start) * 1000
-        statuses = pd.Series([str(result.get("status", "unknown")) for result in self.main_jbf_results.values()])
+        statuses = pd.Series([str(result.get("status", "unknown")) for result in self.main_filter_results.values()])
         alive = int((statuses == "alive").sum())
         dead = int((statuses == "dead").sum())
         unknown = int((statuses == "unknown").sum())
-        self.main_jbf_enable_var.set(True)
+        self.main_filter_enable_var.set(True)
         self.refresh_plot()
         self.status_var.set(
-            f"JBF 평가 완료 | {sampled_text} | alive={alive}, dead={dead}, unknown={unknown}, "
+            f"Filter 평가 완료 | {sampled_text} | filter={filter_name} | alive={alive}, dead={dead}, unknown={unknown}, "
             f"cache_hit={cache_hits}/{total}, elapsed={elapsed_ms:.1f}ms"
         )
 
-    def attach_main_jbf_results(self, plot_df: pd.DataFrame) -> pd.DataFrame:
-        if plot_df.empty or not self.main_jbf_enable_var.get():
+    def attach_main_filter_results(self, plot_df: pd.DataFrame) -> pd.DataFrame:
+        if plot_df.empty or not self.main_filter_enable_var.get():
             return plot_df
-        if self.main_jbf_results:
-            result_ids = set(self.main_jbf_results)
+        if self.main_filter_results:
+            result_ids = set(self.main_filter_results)
             plot_df = plot_df[plot_df["row_id"].astype(int).isin(result_ids)].copy()
             if plot_df.empty:
                 return plot_df
@@ -2676,22 +3067,26 @@ class GroupCameraFeatureExplorer:
         raw_areas = []
         alive_areas = []
         modes = []
+        filter_names = []
         for row_id in out["row_id"].astype(int):
-            result = self.main_jbf_results.get(int(row_id))
+            result = self.main_filter_results.get(int(row_id))
             if result is None:
                 statuses.append("unknown")
                 raw_areas.append(np.nan)
                 alive_areas.append(np.nan)
                 modes.append("")
+                filter_names.append("")
             else:
                 statuses.append(str(result.get("status", "unknown")))
                 raw_areas.append(result.get("raw_area", np.nan))
                 alive_areas.append(result.get("alive_area", np.nan))
                 modes.append(str(result.get("mode", "")))
-        out["jbf_status"] = statuses
-        out["jbf_raw_area"] = raw_areas
-        out["jbf_alive_area"] = alive_areas
-        out["jbf_mode"] = modes
+                filter_names.append(str(result.get("filter_name", "")))
+        out["filter_status"] = statuses
+        out["filter_raw_area"] = raw_areas
+        out["filter_alive_area"] = alive_areas
+        out["filter_mode"] = modes
+        out["filter_name"] = filter_names
         return out
 
     def clear_threshold_table(self) -> None:
@@ -2786,15 +3181,15 @@ class GroupCameraFeatureExplorer:
         plot_df = self.filtered_df[["row_id", "group", "camera_mode", "defect_type", "image_path", feature]].copy()
         plot_df[feature] = pd.to_numeric(plot_df[feature], errors="coerce")
         plot_df = plot_df.dropna(subset=[feature])
-        plot_df = self.attach_main_jbf_results(plot_df)
+        plot_df = self.attach_main_filter_results(plot_df)
         threshold = self.parse_threshold()
 
-        if self.jbf_rate_ax is not None:
+        if self.filter_rate_ax is not None:
             try:
-                self.jbf_rate_ax.remove()
+                self.filter_rate_ax.remove()
             except ValueError:
                 pass
-            self.jbf_rate_ax = None
+            self.filter_rate_ax = None
         self.ax.clear()
         self.ax.patch.set_visible(True)
         self.artist_rows.clear()
@@ -2813,13 +3208,13 @@ class GroupCameraFeatureExplorer:
         plot_df["category"] = list(zip(plot_df["group"].astype(str), plot_df["camera_mode"].astype(str)))
         plot_df["x_base"] = plot_df["category"].map(cat_to_x)
 
-        if self.main_jbf_rate_line_var.get() and "jbf_status" in plot_df.columns and not summary.empty:
+        if self.main_filter_rate_line_var.get() and "filter_status" in plot_df.columns and not summary.empty:
             rate_rows = []
             for _, row in summary.iterrows():
                 cat = (str(row["group"]), str(row["camera_mode"]))
                 x = cat_to_x.get(cat)
-                eval_count = safe_float(row.get("jbf_eval", np.nan))
-                alive_rate = safe_float(row.get("jbf_alive_rate", np.nan))
+                eval_count = safe_float(row.get("filter_eval", np.nan))
+                alive_rate = safe_float(row.get("filter_alive_rate", np.nan))
                 if x is None or not np.isfinite(eval_count) or eval_count <= 0 or not np.isfinite(alive_rate):
                     continue
                 rate_rows.append((x, alive_rate * 100.0, (1.0 - alive_rate) * 100.0))
@@ -2828,12 +3223,12 @@ class GroupCameraFeatureExplorer:
                 xs = [item[0] for item in rate_rows]
                 alive_pct = [item[1] for item in rate_rows]
                 dead_pct = [item[2] for item in rate_rows]
-                self.jbf_rate_ax = self.ax.twinx()
-                self.jbf_rate_ax.set_zorder(0)
-                self.jbf_rate_ax.patch.set_visible(False)
+                self.filter_rate_ax = self.ax.twinx()
+                self.filter_rate_ax.set_zorder(0)
+                self.filter_rate_ax.patch.set_visible(False)
                 self.ax.set_zorder(1)
                 self.ax.patch.set_visible(False)
-                self.jbf_rate_ax.plot(
+                self.filter_rate_ax.plot(
                     xs,
                     alive_pct,
                     color="#2ca02c",
@@ -2842,10 +3237,10 @@ class GroupCameraFeatureExplorer:
                     marker="o",
                     markersize=4,
                     alpha=0.82,
-                    label="JBF Alive %",
+                    label="Filter Alive %",
                     zorder=0,
                 )
-                self.jbf_rate_ax.plot(
+                self.filter_rate_ax.plot(
                     xs,
                     dead_pct,
                     color="#d62728",
@@ -2854,7 +3249,7 @@ class GroupCameraFeatureExplorer:
                     marker="o",
                     markersize=4,
                     alpha=0.82,
-                    label="JBF Dead %",
+                    label="Filter Dead %",
                     zorder=0,
                 )
                 rate_values = alive_pct + dead_pct
@@ -2871,19 +3266,19 @@ class GroupCameraFeatureExplorer:
                     y_min = min(y_min, 90.0)
                 if rate_min <= 2.0:
                     y_max = max(y_max, 10.0)
-                self.jbf_rate_ax.set_ylim(y_min, y_max)
-                self.jbf_rate_ax.set_ylabel("JBF Alive/Dead (%)")
-                self.jbf_rate_ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
-                self.jbf_rate_ax.grid(False)
+                self.filter_rate_ax.set_ylim(y_min, y_max)
+                self.filter_rate_ax.set_ylabel("Filter Alive/Dead (%)")
+                self.filter_rate_ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
+                self.filter_rate_ax.grid(False)
 
         rng = np.random.default_rng(7)
         plot_df["x"] = plot_df["x_base"].astype(float) + rng.uniform(-0.22, 0.22, size=len(plot_df))
 
         for defect_type, part in plot_df.groupby("defect_type", sort=False):
             color = DEFECT_COLORS.get(defect_type, "#666666")
-            if self.main_jbf_enable_var.get() and "jbf_status" in part.columns:
-                edgecolors = part["jbf_status"].map({"alive": "#2ca02c", "dead": "#d62728", "unknown": "#9e9e9e"}).fillna("#9e9e9e").tolist()
-                linewidths = part["jbf_status"].map({"alive": 1.35, "dead": 1.35, "unknown": 0.5}).fillna(0.5).tolist()
+            if self.main_filter_enable_var.get() and "filter_status" in part.columns:
+                edgecolors = part["filter_status"].map({"alive": "#2ca02c", "dead": "#d62728", "unknown": "#9e9e9e"}).fillna("#9e9e9e").tolist()
+                linewidths = part["filter_status"].map({"alive": 1.35, "dead": 1.35, "unknown": 0.5}).fillna(0.5).tolist()
             else:
                 edgecolors = "white"
                 linewidths = 0.45
@@ -2902,16 +3297,16 @@ class GroupCameraFeatureExplorer:
             )
             self.artist_rows[artist] = part["row_id"].astype(int).tolist()
 
-        jbf_status = ""
-        if self.main_jbf_enable_var.get() and "jbf_status" in plot_df.columns:
-            alive = int((plot_df["jbf_status"] == "alive").sum())
-            dead = int((plot_df["jbf_status"] == "dead").sum())
-            unknown = int((plot_df["jbf_status"] == "unknown").sum())
+        filter_status = ""
+        if self.main_filter_enable_var.get() and "filter_status" in plot_df.columns:
+            alive = int((plot_df["filter_status"] == "alive").sum())
+            dead = int((plot_df["filter_status"] == "dead").sum())
+            unknown = int((plot_df["filter_status"] == "unknown").sum())
             evaluated = alive + dead
-            scope_text = f", {self.main_jbf_scope_text}" if self.main_jbf_scope_text else ""
-            jbf_status = f" | JBF eval={evaluated}, alive={alive}, dead={dead}, unknown={unknown}{scope_text}"
-            self.ax.scatter([], [], s=54, facecolors="none", edgecolors="#2ca02c", linewidths=1.5, label=f"JBF Alive ({alive})")
-            self.ax.scatter([], [], s=54, facecolors="none", edgecolors="#d62728", linewidths=1.5, label=f"JBF Dead ({dead})")
+            scope_text = f", {self.main_filter_scope_text}" if self.main_filter_scope_text else ""
+            filter_status = f" | Filter eval={evaluated}, alive={alive}, dead={dead}, unknown={unknown}{scope_text}"
+            self.ax.scatter([], [], s=54, facecolors="none", edgecolors="#2ca02c", linewidths=1.5, label=f"Filter Alive ({alive})")
+            self.ax.scatter([], [], s=54, facecolors="none", edgecolors="#d62728", linewidths=1.5, label=f"Filter Dead ({dead})")
 
         for _, row in summary.iterrows():
             cat = (str(row["group"]), str(row["camera_mode"]))
@@ -2954,8 +3349,8 @@ class GroupCameraFeatureExplorer:
         self.ax.set_xlabel("group x camera_mode")
         self.ax.set_title(f"{feature}: group/camera 분포와 평균")
         handles, legend_labels = self.ax.get_legend_handles_labels()
-        if self.jbf_rate_ax is not None:
-            rate_handles, rate_labels = self.jbf_rate_ax.get_legend_handles_labels()
+        if self.filter_rate_ax is not None:
+            rate_handles, rate_labels = self.filter_rate_ax.get_legend_handles_labels()
             handles += rate_handles
             legend_labels += rate_labels
         self.ax.legend(handles, legend_labels, loc="best", fontsize=8)
@@ -2963,7 +3358,7 @@ class GroupCameraFeatureExplorer:
         self.figure.tight_layout()
         self.canvas.draw_idle()
         self.status_var.set(
-            f"표시 rows={len(plot_df)} | groups={plot_df['group'].nunique()} | cameras={plot_df['camera_mode'].nunique()} | 점 클릭 시 이미지 창 갱신{threshold_status}{jbf_status}"
+            f"표시 rows={len(plot_df)} | groups={plot_df['group'].nunique()} | cameras={plot_df['camera_mode'].nunique()} | 점 클릭 시 이미지 창 갱신{threshold_status}{filter_status}"
         )
 
     def summary_frame(self, plot_df: pd.DataFrame, feature: str) -> pd.DataFrame:
@@ -2984,13 +3379,13 @@ class GroupCameraFeatureExplorer:
         for col in ["진불스크래치", "미세스크래치", "기타"]:
             if col not in summary.columns:
                 summary[col] = 0
-        for col in ["jbf_eval", "jbf_alive", "jbf_dead", "jbf_unknown", "jbf_alive_rate"]:
+        for col in ["filter_eval", "filter_alive", "filter_dead", "filter_unknown", "filter_alive_rate"]:
             summary[col] = np.nan
-        if "jbf_status" in plot_df.columns:
-            jbf_counts = (
+        if "filter_status" in plot_df.columns:
+            filter_counts = (
                 plot_df.pivot_table(
                     index=["group", "camera_mode"],
-                    columns="jbf_status",
+                    columns="filter_status",
                     values="row_id",
                     aggfunc="count",
                     fill_value=0,
@@ -2998,16 +3393,16 @@ class GroupCameraFeatureExplorer:
                 .reset_index()
                 .rename_axis(None, axis=1)
             )
-            summary = summary.drop(columns=["jbf_eval", "jbf_alive", "jbf_dead", "jbf_unknown", "jbf_alive_rate"], errors="ignore")
-            summary = summary.merge(jbf_counts, on=["group", "camera_mode"], how="left")
+            summary = summary.drop(columns=["filter_eval", "filter_alive", "filter_dead", "filter_unknown", "filter_alive_rate"], errors="ignore")
+            summary = summary.merge(filter_counts, on=["group", "camera_mode"], how="left")
             for status in ["alive", "dead", "unknown"]:
                 if status not in summary.columns:
                     summary[status] = 0
-            summary["jbf_alive"] = pd.to_numeric(summary["alive"], errors="coerce").fillna(0).astype(int)
-            summary["jbf_dead"] = pd.to_numeric(summary["dead"], errors="coerce").fillna(0).astype(int)
-            summary["jbf_unknown"] = pd.to_numeric(summary["unknown"], errors="coerce").fillna(0).astype(int)
-            summary["jbf_eval"] = summary["jbf_alive"] + summary["jbf_dead"]
-            summary["jbf_alive_rate"] = summary["jbf_alive"] / summary["jbf_eval"].replace(0, np.nan)
+            summary["filter_alive"] = pd.to_numeric(summary["alive"], errors="coerce").fillna(0).astype(int)
+            summary["filter_dead"] = pd.to_numeric(summary["dead"], errors="coerce").fillna(0).astype(int)
+            summary["filter_unknown"] = pd.to_numeric(summary["unknown"], errors="coerce").fillna(0).astype(int)
+            summary["filter_eval"] = summary["filter_alive"] + summary["filter_dead"]
+            summary["filter_alive_rate"] = summary["filter_alive"] / summary["filter_eval"].replace(0, np.nan)
         return summary
 
     def sorted_categories(self, summary: pd.DataFrame) -> list[tuple[str, str]]:
@@ -3043,11 +3438,11 @@ class GroupCameraFeatureExplorer:
         for _, row in summary.iterrows():
             values = [
                 row["group"],
-                "" if pd.isna(row.get("jbf_alive", np.nan)) else int(row.get("jbf_alive", 0)),
-                "" if pd.isna(row.get("jbf_dead", np.nan)) else int(row.get("jbf_dead", 0)),
-                "" if pd.isna(row.get("jbf_eval", np.nan)) else int(row.get("jbf_eval", 0)),
-                "" if pd.isna(row.get("jbf_unknown", np.nan)) else int(row.get("jbf_unknown", 0)),
-                "" if pd.isna(row.get("jbf_alive_rate", np.nan)) else self.format_percent(row.get("jbf_alive_rate")),
+                "" if pd.isna(row.get("filter_alive", np.nan)) else int(row.get("filter_alive", 0)),
+                "" if pd.isna(row.get("filter_dead", np.nan)) else int(row.get("filter_dead", 0)),
+                "" if pd.isna(row.get("filter_eval", np.nan)) else int(row.get("filter_eval", 0)),
+                "" if pd.isna(row.get("filter_unknown", np.nan)) else int(row.get("filter_unknown", 0)),
+                "" if pd.isna(row.get("filter_alive_rate", np.nan)) else self.format_percent(row.get("filter_alive_rate")),
                 row["camera_mode"],
                 int(row["count"]),
                 self.format_number(row["mean"]),

@@ -784,12 +784,12 @@ class ImageViewer:
         else:
             clustered_display = clustered
             refined_display = refined
-        if (angle_enabled or ratio_enabled) and self.mask_array is not None:
+        if ratio_enabled and self.mask_array is not None:
             refined_display = self.draw_angle_overlay(
                 refined_display,
                 self.mask_array,
-                show_angle=angle_enabled,
-                show_ratio=ratio_enabled,
+                show_angle=False,
+                show_ratio=True,
             )
 
         self.adjusted_photo = ImageTk.PhotoImage(self.to_display_image(adjusted))

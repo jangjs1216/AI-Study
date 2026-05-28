@@ -197,6 +197,7 @@ class ImageViewer:
         self.refine_kernel_w_var = tk.IntVar(value=3)
         self.refine_kernel_h_var = tk.IntVar(value=3)
         self.refine_angle_var = tk.BooleanVar(value=False)
+        self.refine_ratio_var = tk.BooleanVar(value=False)
         self.jbf_enable_var = tk.BooleanVar(value=False)
         self.jbf_diameter_var = tk.IntVar(value=15)
         self.jbf_sigma_color_var = tk.DoubleVar(value=30.0)
@@ -353,6 +354,12 @@ class ImageViewer:
             basic_refine_row,
             text="Angle",
             variable=self.refine_angle_var,
+            command=self.schedule_render,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(
+            basic_refine_row,
+            text="Ratio",
+            variable=self.refine_ratio_var,
             command=self.schedule_render,
         ).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(basic_refine_row, text="Kernel").pack(side=tk.LEFT, padx=(0, 4))
@@ -621,6 +628,7 @@ class ImageViewer:
         self.remove_border_bg_var.set(False)
         self.refine_enable_var.set(True)
         self.refine_angle_var.set(False)
+        self.refine_ratio_var.set(False)
         self.refine_kernel_var.set(3)
         self.refine_kernel_w_var.set(3)
         self.refine_kernel_h_var.set(3)
@@ -736,6 +744,7 @@ class ImageViewer:
         k = int(self.cluster_k_var.get())
         base, correction_text = self.make_analysis_base()
         angle_enabled = bool(self.refine_angle_var.get())
+        ratio_enabled = bool(self.refine_ratio_var.get())
         if self.active_filter_pipeline is not None and self.pipeline_preview_renderer is not None:
             pipeline = self.active_pipeline_from_controls()
             adjusted, clustered, refined, stats_text = self.pipeline_preview_renderer(base, self.mask_array, pipeline)
@@ -773,8 +782,13 @@ class ImageViewer:
         else:
             clustered_display = clustered
             refined_display = refined
-        if angle_enabled and self.mask_array is not None:
-            refined_display = self.draw_angle_overlay(refined_display, self.mask_array)
+        if (angle_enabled or ratio_enabled) and self.mask_array is not None:
+            refined_display = self.draw_angle_overlay(
+                refined_display,
+                self.mask_array,
+                show_angle=angle_enabled,
+                show_ratio=ratio_enabled,
+            )
 
         self.adjusted_photo = ImageTk.PhotoImage(self.to_display_image(adjusted))
         self.cluster_photo = ImageTk.PhotoImage(self.to_display_image(clustered_display))
@@ -830,8 +844,42 @@ class ImageViewer:
         out[overlay_mask] = (1.0 - alpha) * base_f[overlay_mask] + alpha * overlay_f[overlay_mask]
         return np.clip(out, 0, 255).astype(np.uint8)
 
+    @staticmethod
+    def draw_readable_text(
+        draw: ImageDraw.ImageDraw,
+        xy: tuple[float, float],
+        lines: list[str],
+        fill: tuple[int, int, int],
+        bg_fill: tuple[int, int, int] = (0, 0, 0),
+        padding: int = 3,
+    ) -> None:
+        if not lines:
+            return
+        x, y = xy
+        text = "\n".join(lines)
+        try:
+            bbox = draw.multiline_textbbox((x, y), text, spacing=2)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+        except AttributeError:
+            widths = [draw.textlength(line) for line in lines]
+            text_w = int(max(widths, default=0))
+            text_h = 12 * len(lines) + 2 * max(len(lines) - 1, 0)
+        draw.rectangle(
+            [x - padding, y - padding, x + text_w + padding, y + text_h + padding],
+            fill=bg_fill,
+        )
+        draw.multiline_text((x, y), text, fill=fill, spacing=2)
+
     @classmethod
-    def draw_angle_overlay(cls, array: np.ndarray, mask: np.ndarray, max_components: int = 80) -> np.ndarray:
+    def draw_angle_overlay(
+        cls,
+        array: np.ndarray,
+        mask: np.ndarray,
+        max_components: int = 80,
+        show_angle: bool = True,
+        show_ratio: bool = False,
+    ) -> np.ndarray:
         if mask is None or mask.shape != array.shape[:2] or not mask.any():
             return array
 
@@ -856,28 +904,35 @@ class ImageViewer:
             polygon = [(float(x), float(y)) for x, y in corners]
             draw.line(polygon + [polygon[0]], fill=(255, 0, 0), width=line_width)
 
-            w_axis = min(max(major_len * 0.5, 18.0), 90.0)
-            h_axis = min(max(minor_len * 0.5, 14.0), 70.0)
-            w0 = (center_x - ux * w_axis, center_y - uy * w_axis)
-            w1 = (center_x + ux * w_axis, center_y + uy * w_axis)
-            h0 = (center_x - vx * h_axis, center_y - vy * h_axis)
-            h1 = (center_x + vx * h_axis, center_y + vy * h_axis)
+            if show_angle:
+                w_axis = min(max(major_len * 0.5, 18.0), 90.0)
+                h_axis = min(max(minor_len * 0.5, 14.0), 70.0)
+                w0 = (center_x - ux * w_axis, center_y - uy * w_axis)
+                w1 = (center_x + ux * w_axis, center_y + uy * w_axis)
+                h0 = (center_x - vx * h_axis, center_y - vy * h_axis)
+                h1 = (center_x + vx * h_axis, center_y + vy * h_axis)
 
-            draw.line([w0, w1], fill=(255, 255, 0), width=line_width + 1)
-            draw.line([h0, h1], fill=(0, 255, 255), width=line_width + 1)
-            draw.ellipse(
-                [center_x - line_width, center_y - line_width, center_x + line_width, center_y + line_width],
-                fill=(255, 0, 0),
-            )
+                draw.line([w0, w1], fill=(255, 255, 0), width=line_width + 1)
+                draw.line([h0, h1], fill=(0, 255, 255), width=line_width + 1)
+                draw.ellipse(
+                    [center_x - line_width, center_y - line_width, center_x + line_width, center_y + line_width],
+                    fill=(255, 0, 0),
+                )
 
             if index < 20:
-                label_x = max(0.0, min(w - 80.0, min(x for x, _y in polygon)))
-                label_y = max(0.0, min(h - 12.0, min(y for _x, y in polygon) - 12.0))
-                text = f"{angle:.1f} deg"
-                draw.text((label_x + 1, label_y + 1), text, fill=(0, 0, 0))
-                draw.text((label_x, label_y), text, fill=(255, 0, 0))
-                draw.text((w1[0] + 2, w1[1] + 2), "W", fill=(255, 255, 0))
-                draw.text((h1[0] + 2, h1[1] + 2), "H", fill=(0, 255, 255))
+                label_lines = []
+                if show_angle:
+                    label_lines.append(f"A={angle:.1f} deg")
+                if show_ratio:
+                    ratio = major_len / max(minor_len, 1e-6)
+                    label_lines.append(f"BBox {major_len:.0f}x{minor_len:.0f}")
+                    label_lines.append(f"R={ratio:.2f}")
+                label_x = max(0.0, min(w - 120.0, min(x for x, _y in polygon)))
+                label_y = max(0.0, min(h - 46.0, min(y for _x, y in polygon) - 36.0))
+                cls.draw_readable_text(draw, (label_x, label_y), label_lines, fill=(255, 255, 255))
+                if show_angle:
+                    draw.text((w1[0] + 2, w1[1] + 2), "W", fill=(255, 255, 0))
+                    draw.text((h1[0] + 2, h1[1] + 2), "H", fill=(0, 255, 255))
 
         return np.asarray(image, dtype=np.uint8)
 

@@ -270,62 +270,74 @@ class ImageViewer:
             command=lambda _value: self.schedule_render(),
         )
         k_scale.pack(side=tk.LEFT, padx=(0, 18))
-        ttk.Checkbutton(
-            control_frame,
-            text="수직 상쇄",
-            variable=self.directional_cancel_var,
-            command=self.schedule_render,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Label(control_frame, text="강도").pack(side=tk.LEFT, padx=(0, 4))
-        cancel_strength_scale = tk.Scale(
-            control_frame,
-            from_=0.0,
-            to=1.0,
-            resolution=0.05,
-            orient=tk.HORIZONTAL,
-            variable=self.directional_strength_var,
-            length=130,
-            command=lambda _value: self.schedule_render(),
-        )
-        cancel_strength_scale.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Label(control_frame, text="탐색").pack(side=tk.LEFT, padx=(0, 4))
-        cancel_radius_scale = tk.Scale(
-            control_frame,
-            from_=2,
-            to=24,
-            resolution=1,
-            orient=tk.HORIZONTAL,
-            variable=self.directional_radius_var,
-            length=130,
-            command=lambda _value: self.schedule_render(),
-        )
-        cancel_radius_scale.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Checkbutton(
-            control_frame,
-            text="Mask 영역 K-Means",
-            variable=self.cluster_mask_only_var,
-            command=self.schedule_render,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Checkbutton(
-            control_frame,
-            text="외곽 배경 제거",
-            variable=self.remove_border_bg_var,
-            command=self.schedule_render,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Checkbutton(
-            control_frame,
-            text="Overlap",
-            variable=self.overlap_var,
-            command=self.schedule_render,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(control_frame, text="현재 Filter 가져오기", command=self.apply_current_filter_pipeline).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(control_frame, text="Reset", command=self.reset_controls).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(control_frame, text="K-Means는 보정/contrast/blur 적용 후 RGB 픽셀값 기준").pack(side=tk.LEFT)
 
         param_notebook = ttk.Notebook(self.window)
         param_notebook.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 8))
+        kmeans_tab = ttk.Frame(param_notebook, padding=(8, 6))
+        param_notebook.add(kmeans_tab, text="K-Means")
         refine_tab = ttk.Frame(param_notebook, padding=(8, 6))
         param_notebook.add(refine_tab, text="Refinement")
+        direction_tab = ttk.Frame(param_notebook, padding=(8, 6))
+        param_notebook.add(direction_tab, text="Directional")
+        kmeans_row = ttk.Frame(kmeans_tab)
+        kmeans_row.pack(side=tk.TOP, fill=tk.X)
+        ttk.Checkbutton(
+            kmeans_row,
+            text="Mask 영역 K-Means",
+            variable=self.cluster_mask_only_var,
+            command=self.schedule_render,
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Checkbutton(
+            kmeans_row,
+            text="외곽 배경 제거",
+            variable=self.remove_border_bg_var,
+            command=self.schedule_render,
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Checkbutton(
+            kmeans_row,
+            text="Overlap",
+            variable=self.overlap_var,
+            command=self.schedule_render,
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Button(kmeans_row, text="현재 Filter 가져오기", command=self.apply_current_filter_pipeline).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(kmeans_row, text="외곽 배경 제거는 K>1에서 mask 외곽 band가 가장 닮은 cluster를 배경으로 제거").pack(side=tk.LEFT)
+
+        direction_row = ttk.Frame(direction_tab)
+        direction_row.pack(side=tk.TOP, fill=tk.X)
+        ttk.Checkbutton(
+            direction_row,
+            text="수직 상쇄",
+            variable=self.directional_cancel_var,
+            command=self.schedule_render,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(direction_row, text="강도").pack(side=tk.LEFT, padx=(0, 4))
+        cancel_strength_scale = tk.Scale(
+            direction_row,
+            from_=0.0,
+            to=1.0,
+            resolution=0.05,
+            orient=tk.HORIZONTAL,
+            variable=self.directional_strength_var,
+            length=180,
+            command=lambda _value: self.schedule_render(),
+        )
+        cancel_strength_scale.pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Label(direction_row, text="탐색").pack(side=tk.LEFT, padx=(0, 4))
+        cancel_radius_scale = tk.Scale(
+            direction_row,
+            from_=2,
+            to=24,
+            resolution=1,
+            orient=tk.HORIZONTAL,
+            variable=self.directional_radius_var,
+            length=180,
+            command=lambda _value: self.schedule_render(),
+        )
+        cancel_radius_scale.pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Label(direction_row, text="mask 방향과 수직인 주변 픽셀로 선형 성분을 상쇄").pack(side=tk.LEFT)
+
         basic_refine_row = ttk.Frame(refine_tab)
         basic_refine_row.pack(side=tk.TOP, fill=tk.X)
         jbf_refine_row = ttk.Frame(refine_tab)

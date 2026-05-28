@@ -68,7 +68,7 @@ DEFECT_COLORS = {
     "기타": "#4c78a8",
 }
 
-MAIN_FILTER_CACHE_VERSION = "main_filter_v2"
+MAIN_FILTER_CACHE_VERSION = "main_filter_v3"
 OPENCV_JBF_INSTALL_HINT = "OpenCV Joint Bilateral Filter는 opencv-contrib-python의 cv2.ximgproc가 필요합니다."
 
 KOREAN_FONT_CANDIDATES = [
@@ -2887,22 +2887,36 @@ class GroupCameraFeatureExplorer:
         mask_bool = mask.astype(bool)
         if not mask_bool.any():
             return 0.0, 0, 0
-        yy, xx = np.where(mask_bool)
-        width = int(xx.max() - xx.min() + 1)
-        height = int(yy.max() - yy.min() + 1)
-        major = max(width, height)
-        minor = max(min(width, height), 1)
-        return float(major / minor), width, height
+        coords_yx: np.ndarray
+        if cv2 is not None:
+            num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+                mask_bool.astype(np.uint8),
+                connectivity=8,
+            )
+            if num_labels > 1:
+                areas = stats[1:, cv2.CC_STAT_AREA]
+                label_id = int(np.argmax(areas)) + 1
+                coords_yx = np.column_stack(np.where(labels == label_id)).astype(np.int32)
+            else:
+                coords_yx = np.column_stack(np.where(mask_bool)).astype(np.int32)
+        else:
+            components = ImageViewer.connected_components_bool(mask_bool, min_area=8)
+            coords_yx = max(components, key=len) if components else np.column_stack(np.where(mask_bool)).astype(np.int32)
+
+        geometry = ImageViewer.component_angle_geometry(coords_yx)
+        major = max(float(geometry["major_length"]), 1.0)
+        minor = max(float(geometry["minor_length"]), 1.0)
+        return float(major / minor), int(round(major)), int(round(minor))
 
     def bbox_gate_decision(self, mask: np.ndarray, pipeline: dict[str, object]) -> tuple[bool, str, float]:
         ratio, width, height = self.bbox_ratio_from_mask(mask)
         if not bool(pipeline.get("bbox_gate_enabled", False)):
-            return True, f"bbox_gate=off(R={ratio:.2f},{width}x{height})", ratio
+            return True, f"bbox_gate=off(oriented R={ratio:.2f},{width}x{height})", ratio
         threshold = max(float(pipeline.get("bbox_gate_min_ratio", 10.0)), 1.0)
         passed = ratio >= threshold
         action = "pass" if passed else "skip_keep"
         comparator = ">=" if passed else "<"
-        return passed, f"bbox_gate={action}(R={ratio:.2f}{comparator}{threshold:.2f},{width}x{height})", ratio
+        return passed, f"bbox_gate={action}(oriented R={ratio:.2f}{comparator}{threshold:.2f},{width}x{height})", ratio
 
     def clear_main_filter_state(self, clear_arrays: bool = False) -> None:
         self.main_filter_results.clear()

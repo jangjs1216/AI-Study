@@ -187,6 +187,7 @@ class ImageViewer:
         self.directional_strength_var = tk.DoubleVar(value=0.8)
         self.directional_radius_var = tk.IntVar(value=8)
         self.cluster_mask_only_var = tk.BooleanVar(value=True)
+        self.remove_border_bg_var = tk.BooleanVar(value=False)
         self.refine_enable_var = tk.BooleanVar(value=True)
         self.refine_kernel_var = tk.IntVar(value=3)
         self.refine_open_iter_var = tk.IntVar(value=1)
@@ -303,6 +304,12 @@ class ImageViewer:
             control_frame,
             text="Mask 영역 K-Means",
             variable=self.cluster_mask_only_var,
+            command=self.schedule_render,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Checkbutton(
+            control_frame,
+            text="외곽 배경 제거",
+            variable=self.remove_border_bg_var,
             command=self.schedule_render,
         ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Checkbutton(
@@ -599,6 +606,7 @@ class ImageViewer:
         self.directional_strength_var.set(0.8)
         self.directional_radius_var.set(8)
         self.cluster_mask_only_var.set(True)
+        self.remove_border_bg_var.set(False)
         self.refine_enable_var.set(True)
         self.refine_angle_var.set(False)
         self.refine_kernel_var.set(3)
@@ -636,6 +644,7 @@ class ImageViewer:
         self.cluster_k_var.set(int(pipeline.get("k", 1)) if bool(pipeline.get("kmeans_enabled", False)) else 1)
         self.directional_cancel_var.set(False)
         self.cluster_mask_only_var.set(True)
+        self.remove_border_bg_var.set(str(pipeline.get("cluster_select", "")) == "border_background")
         self.refine_enable_var.set(bool(pipeline.get("refine_enabled", False)))
         self.refine_angle_var.set(bool(pipeline.get("refine_angle_enabled", False)))
         self.refine_kernel_var.set(int(pipeline.get("refine_kernel", 3)))
@@ -659,6 +668,13 @@ class ImageViewer:
 
     def active_pipeline_from_controls(self) -> dict[str, object]:
         pipeline = deepcopy(self.active_filter_pipeline) if self.active_filter_pipeline is not None else {}
+        existing_cluster_select = str(pipeline.get("cluster_select", "all"))
+        if bool(self.remove_border_bg_var.get()) and int(self.cluster_k_var.get()) > 1:
+            cluster_select = "border_background"
+        elif existing_cluster_select == "border_background":
+            cluster_select = "all"
+        else:
+            cluster_select = existing_cluster_select
         pipeline.update(
             {
                 "source": self.source_var.get(),
@@ -666,6 +682,7 @@ class ImageViewer:
                 "blur": float(self.blur_var.get()),
                 "kmeans_enabled": int(self.cluster_k_var.get()) > 1,
                 "k": int(self.cluster_k_var.get()),
+                "cluster_select": cluster_select,
                 "refine_enabled": bool(self.refine_enable_var.get()),
                 "refine_kernel": int(self.refine_kernel_var.get()),
                 "refine_kernel_w": int(self.refine_kernel_w_var.get()),
@@ -736,6 +753,7 @@ class ImageViewer:
                 refine_open_iter=int(self.refine_open_iter_var.get()),
                 refine_close_iter=int(self.refine_close_iter_var.get()),
                 refine_min_area=int(self.refine_min_area_var.get()),
+                remove_border_background=bool(self.remove_border_bg_var.get()),
             )
         if self.overlap_var.get():
             clustered_display = self.overlay_result(adjusted, clustered, alpha=0.8)
@@ -1522,6 +1540,56 @@ class ImageViewer:
         }
 
     @classmethod
+    def border_band_mask(cls, valid_mask: np.ndarray) -> np.ndarray:
+        valid = valid_mask.astype(bool)
+        if not valid.any():
+            return valid
+        eroded = cls.binary_erode_rect(valid, 3, 3)
+        border = valid & ~eroded
+        min_border = max(8, int(valid.sum() * 0.01))
+        if int(border.sum()) < min_border:
+            return valid
+        return border
+
+    @classmethod
+    def infer_border_background_cluster(
+        cls,
+        labels_2d: np.ndarray,
+        valid_mask: np.ndarray,
+        centers: np.ndarray,
+        image_array: np.ndarray,
+        counts: np.ndarray | None = None,
+    ) -> tuple[int | None, str]:
+        if centers is None or len(centers) <= 1:
+            return None, "border_bg=off"
+        k = int(len(centers))
+        border = cls.border_band_mask(valid_mask)
+        border_labels = labels_2d[border]
+        border_labels = border_labels[(border_labels >= 0) & (border_labels < k)]
+        if len(border_labels) <= 0:
+            if counts is not None and len(counts):
+                cluster_id = int(np.argmax(counts))
+                return cluster_id, f"border_bg=C{cluster_id}(fallback=largest)"
+            return None, "border_bg=none"
+
+        border_counts = np.bincount(border_labels.astype(np.int16), minlength=k).astype(np.float32)
+        occupancy = border_counts / max(float(border_counts.sum()), 1.0)
+        border_pixels = image_array[border].reshape(-1, 3).astype(np.float32)
+        border_mean = border_pixels.mean(axis=0)
+        center_dist = np.linalg.norm(centers.astype(np.float32) - border_mean[None, :], axis=1)
+        dist_span = float(center_dist.max() - center_dist.min())
+        if dist_span < 1e-6:
+            color_score = np.ones(k, dtype=np.float32)
+        else:
+            color_score = 1.0 - ((center_dist - center_dist.min()) / (dist_span + 1e-6))
+        score = occupancy * 0.75 + color_score * 0.25
+        cluster_id = int(np.argmax(score))
+        return (
+            cluster_id,
+            f"border_bg=C{cluster_id}, border_occ={occupancy[cluster_id]:.2f}, color_dist={center_dist[cluster_id]:.1f}",
+        )
+
+    @classmethod
     def cluster_spatial_summary(
         cls,
         labels_2d: np.ndarray,
@@ -1674,6 +1742,7 @@ class ImageViewer:
         refine_open_iter: int = 1,
         refine_close_iter: int = 1,
         refine_min_area: int = 12,
+        remove_border_background: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, str]:
         kmeans_start = time.perf_counter()
         k = int(np.clip(k, 1, 8))
@@ -1758,10 +1827,24 @@ class ImageViewer:
         total = max(int(counts.sum()), 1)
         labels_2d = np.full((h, w), -1, dtype=np.int16)
         labels_2d[valid_mask] = ordered_labels
+        process_mask = valid_mask
+        border_bg_text = "border_bg=off"
+        if remove_border_background and k > 1:
+            bg_cluster_id, border_bg_text = ImageViewer.infer_border_background_cluster(
+                labels_2d,
+                valid_mask,
+                ordered_centers,
+                array,
+                counts,
+            )
+            if bg_cluster_id is not None:
+                background_pixels = (labels_2d == bg_cluster_id) & valid_mask
+                clustered[background_pixels] = 0
+                process_mask = valid_mask & (labels_2d != bg_cluster_id)
         kmeans_ms = (time.perf_counter() - kmeans_start) * 1000
         spatial_text, _spatial_ms, _rows, refined_labels = ImageViewer.cluster_spatial_summary(
             labels_2d,
-            valid_mask,
+            process_mask,
             k,
             counts,
             refine_kernel=refine_kernel,
@@ -1808,7 +1891,7 @@ class ImageViewer:
                 f"mo={jbf_morph_open}, mc={jbf_morph_close}, blur={jbf_blur_kernel}, th={jbf_threshold:.1f}/255)"
             )
         kmeans_text = f"kmeans={kmeans_mode_text}" if k == 1 else f"kmeans={kmeans_ms:.1f}ms"
-        return clustered, refined, f"{kmeans_text} | {refine_text} | color: {' | '.join(stats)} | {spatial_text}"
+        return clustered, refined, f"{kmeans_text} | {border_bg_text} | {refine_text} | color: {' | '.join(stats)} | {spatial_text}"
 
 
 class GroupCameraFeatureExplorer:
@@ -2350,7 +2433,7 @@ class GroupCameraFeatureExplorer:
             kmeans,
             textvariable=vars_map["cluster_select"],
             state="readonly",
-            values=["all", "darkest", "brightest", "largest", "smallest"],
+            values=["all", "border_background", "darkest", "brightest", "largest", "smallest"],
             width=12,
         ).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(kmeans, text="Order").pack(side=tk.LEFT, padx=(0, 4))
@@ -2858,11 +2941,26 @@ class GroupCameraFeatureExplorer:
         valid_mask: np.ndarray,
         counts: np.ndarray,
         cluster_select: str,
+        centers: np.ndarray | None = None,
+        image_array: np.ndarray | None = None,
     ) -> tuple[np.ndarray, str]:
         if counts.size <= 0:
             return np.zeros_like(valid_mask, dtype=bool), "cluster=none"
         select = str(cluster_select or "all")
         nonzero = np.where(counts > 0)[0]
+        if select == "border_background" and centers is not None and image_array is not None:
+            bg_cluster_id, bg_text = ImageViewer.infer_border_background_cluster(
+                labels_2d,
+                valid_mask,
+                centers,
+                image_array,
+                counts,
+            )
+            if bg_cluster_id is not None:
+                candidate = valid_mask & (labels_2d != int(bg_cluster_id))
+                return candidate, bg_text
+            select = "largest"
+
         if select == "darkest":
             selected = [0]
         elif select == "brightest":
@@ -2964,7 +3062,7 @@ class GroupCameraFeatureExplorer:
         )
         clustered = np.zeros((h, w, 3), dtype=np.uint8)
         if k > 1:
-            labels_2d, _centers, counts, kmeans_ms = self.kmeans_labels_for_filter(adjusted, valid_mask, k)
+            labels_2d, centers, counts, kmeans_ms = self.kmeans_labels_for_filter(adjusted, valid_mask, k)
             for cluster_id in range(min(len(counts), len(palette))):
                 clustered[(labels_2d == cluster_id) & valid_mask] = palette[cluster_id]
             candidate, cluster_text = self.select_kmeans_candidate(
@@ -2972,7 +3070,11 @@ class GroupCameraFeatureExplorer:
                 valid_mask,
                 counts,
                 str(pipeline.get("cluster_select", "all")),
+                centers=centers,
+                image_array=adjusted,
             )
+            if str(pipeline.get("cluster_select", "all")) == "border_background":
+                clustered[valid_mask & ~candidate] = 0
             if str(pipeline.get("cluster_select", "all")) != "all":
                 selected_overlay = candidate & valid_mask
                 clustered[selected_overlay] = np.clip(
@@ -3075,12 +3177,14 @@ class GroupCameraFeatureExplorer:
                 )
                 mode_parts = [f"source={source_name}"]
                 if bool(pipeline.get("kmeans_enabled", False)) and int(pipeline.get("k", 1)) > 1:
-                    labels_2d, _centers, counts, kmeans_ms = self.kmeans_labels_for_filter(adjusted, mask, int(pipeline.get("k", 2)))
+                    labels_2d, centers, counts, kmeans_ms = self.kmeans_labels_for_filter(adjusted, mask, int(pipeline.get("k", 2)))
                     candidate, cluster_text = self.select_kmeans_candidate(
                         labels_2d,
                         mask,
                         counts,
                         str(pipeline.get("cluster_select", "all")),
+                        centers=centers,
+                        image_array=adjusted,
                     )
                     mode_parts.append(f"kmeans={kmeans_ms:.1f}ms")
                     mode_parts.append(cluster_text)

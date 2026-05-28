@@ -68,7 +68,7 @@ DEFECT_COLORS = {
     "기타": "#4c78a8",
 }
 
-MAIN_FILTER_CACHE_VERSION = "main_filter_v1"
+MAIN_FILTER_CACHE_VERSION = "main_filter_v2"
 OPENCV_JBF_INSTALL_HINT = "OpenCV Joint Bilateral Filter는 opencv-contrib-python의 cv2.ximgproc가 필요합니다."
 
 KOREAN_FONT_CANDIDATES = [
@@ -698,6 +698,8 @@ class ImageViewer:
         pipeline.update(
             {
                 "source": self.source_var.get(),
+                "bbox_gate_enabled": bool(pipeline.get("bbox_gate_enabled", False)),
+                "bbox_gate_min_ratio": float(pipeline.get("bbox_gate_min_ratio", 10.0)),
                 "contrast": float(self.contrast_var.get()),
                 "blur": float(self.blur_var.get()),
                 "kmeans_enabled": int(self.cluster_k_var.get()) > 1,
@@ -2044,6 +2046,8 @@ class GroupCameraFeatureExplorer:
         return {
             "name": name,
             "source": "image_path",
+            "bbox_gate_enabled": False,
+            "bbox_gate_min_ratio": 10.0,
             "contrast": 1.0,
             "blur": 0.0,
             "kmeans_enabled": False,
@@ -2311,7 +2315,7 @@ class GroupCameraFeatureExplorer:
     def open_filter_manager(self) -> None:
         window = tk.Toplevel(self.root)
         window.title("Filter Pipeline 관리")
-        window.geometry("980x720")
+        window.geometry("980x760")
         window.transient(self.root)
 
         outer = ttk.Frame(window, padding=10)
@@ -2332,6 +2336,8 @@ class GroupCameraFeatureExplorer:
         vars_map: dict[str, tk.Variable] = {
             "name": tk.StringVar(),
             "source": tk.StringVar(),
+            "bbox_gate_enabled": tk.BooleanVar(),
+            "bbox_gate_min_ratio": tk.DoubleVar(),
             "contrast": tk.DoubleVar(),
             "blur": tk.DoubleVar(),
             "kmeans_enabled": tk.BooleanVar(),
@@ -2367,6 +2373,8 @@ class GroupCameraFeatureExplorer:
             return {
                 "name": name,
                 "source": str(vars_map["source"].get() or "image_path"),
+                "bbox_gate_enabled": bool(vars_map["bbox_gate_enabled"].get()),
+                "bbox_gate_min_ratio": float(vars_map["bbox_gate_min_ratio"].get()),
                 "contrast": float(vars_map["contrast"].get()),
                 "blur": float(vars_map["blur"].get()),
                 "kmeans_enabled": bool(vars_map["kmeans_enabled"].get()),
@@ -2480,6 +2488,26 @@ class GroupCameraFeatureExplorer:
             width=20,
         ).grid(row=row, column=1, sticky="w", pady=3)
         row += 1
+
+        bbox_gate = ttk.LabelFrame(edit_frame, text="BBox Ratio Gate", padding=(8, 6))
+        bbox_gate.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        row += 1
+        ttk.Checkbutton(
+            bbox_gate,
+            text="Use gate",
+            variable=vars_map["bbox_gate_enabled"],
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(bbox_gate, text="Apply filter only if major/minor >=").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Scale(
+            bbox_gate,
+            from_=1.0,
+            to=50.0,
+            resolution=0.5,
+            orient=tk.HORIZONTAL,
+            variable=vars_map["bbox_gate_min_ratio"],
+            length=220,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(bbox_gate, text="Fail: keep original mask alive").pack(side=tk.LEFT)
 
         prep = ttk.LabelFrame(edit_frame, text="Preprocess", padding=(8, 6))
         prep.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
@@ -2854,6 +2882,28 @@ class GroupCameraFeatureExplorer:
     def main_filter_params_tuple(self, pipeline: dict[str, object]) -> tuple[object, ...]:
         return (MAIN_FILTER_CACHE_VERSION, self.freeze_for_cache(pipeline))
 
+    @staticmethod
+    def bbox_ratio_from_mask(mask: np.ndarray) -> tuple[float, int, int]:
+        mask_bool = mask.astype(bool)
+        if not mask_bool.any():
+            return 0.0, 0, 0
+        yy, xx = np.where(mask_bool)
+        width = int(xx.max() - xx.min() + 1)
+        height = int(yy.max() - yy.min() + 1)
+        major = max(width, height)
+        minor = max(min(width, height), 1)
+        return float(major / minor), width, height
+
+    def bbox_gate_decision(self, mask: np.ndarray, pipeline: dict[str, object]) -> tuple[bool, str, float]:
+        ratio, width, height = self.bbox_ratio_from_mask(mask)
+        if not bool(pipeline.get("bbox_gate_enabled", False)):
+            return True, f"bbox_gate=off(R={ratio:.2f},{width}x{height})", ratio
+        threshold = max(float(pipeline.get("bbox_gate_min_ratio", 10.0)), 1.0)
+        passed = ratio >= threshold
+        action = "pass" if passed else "skip_keep"
+        comparator = ">=" if passed else "<"
+        return passed, f"bbox_gate={action}(R={ratio:.2f}{comparator}{threshold:.2f},{width}x{height})", ratio
+
     def clear_main_filter_state(self, clear_arrays: bool = False) -> None:
         self.main_filter_results.clear()
         self.main_filter_cache.clear()
@@ -3128,6 +3178,20 @@ class GroupCameraFeatureExplorer:
             dtype=np.uint8,
         )
         clustered = np.zeros((h, w, 3), dtype=np.uint8)
+        gate_pass, gate_text, _bbox_ratio = self.bbox_gate_decision(valid_mask, pipeline)
+        mode_parts.append(gate_text)
+        if not gate_pass:
+            raw_area = int(valid_mask.sum())
+            clustered[valid_mask] = adjusted[valid_mask]
+            refined = np.zeros((h, w, 3), dtype=np.uint8)
+            refined[valid_mask] = np.array([44, 160, 44], dtype=np.uint8)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            stats_text = (
+                f"order=skipped_by_bbox_gate, raw_area={raw_area}, alive_area={raw_area}, "
+                f"status=alive, elapsed={elapsed_ms:.1f}ms | {' | '.join(mode_parts)}"
+            )
+            return adjusted, clustered, refined, stats_text
+
         if k > 1:
             labels_2d, centers, counts, kmeans_ms = self.kmeans_labels_for_filter(adjusted, valid_mask, k)
             for cluster_id in range(min(len(counts), len(palette))):
@@ -3238,11 +3302,27 @@ class GroupCameraFeatureExplorer:
                     "cache_hit": False,
                 }
             else:
+                mode_parts = [f"source={source_name}"]
+                gate_pass, gate_text, _bbox_ratio = self.bbox_gate_decision(mask, pipeline)
+                mode_parts.append(gate_text)
+                if not gate_pass:
+                    elapsed_ms = (time.perf_counter() - start) * 1000
+                    result = {
+                        "filter_name": filter_name,
+                        "status": "alive",
+                        "raw_area": mask_area,
+                        "alive_area": mask_area,
+                        "elapsed_ms": float(elapsed_ms),
+                        "mode": " | ".join(mode_parts),
+                        "cache_hit": False,
+                    }
+                    self.set_main_filter_result_cache(cache_key, result)
+                    return result
+
                 adjusted = ImageViewer.apply_blur(
                     ImageViewer.apply_contrast(guide, float(pipeline.get("contrast", 1.0))),
                     float(pipeline.get("blur", 0.0)),
                 )
-                mode_parts = [f"source={source_name}"]
                 if bool(pipeline.get("kmeans_enabled", False)) and int(pipeline.get("k", 1)) > 1:
                     labels_2d, centers, counts, kmeans_ms = self.kmeans_labels_for_filter(adjusted, mask, int(pipeline.get("k", 2)))
                     candidate, cluster_text = self.select_kmeans_candidate(

@@ -15,6 +15,12 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = None
+    ImageTk = None
+
 
 FACES = ("A", "BL", "BT", "BB", "BR", "C")
 ROOT_SLOTS = ("A", "BL/BR", "BT/BB", "C")
@@ -645,6 +651,20 @@ def summarize_imeis(patches: list[PatchImage]) -> list[tuple[str, int, int, int,
     return rows
 
 
+def patch_sort_key(patch: PatchImage) -> tuple[str, str, str, str, int, int, str, str, str]:
+    return (
+        patch.imei,
+        patch.category,
+        patch.face,
+        patch.hhmmss,
+        patch.row,
+        patch.col,
+        patch.defect_type,
+        patch.vector,
+        str(patch.path),
+    )
+
+
 def max_count(counts: dict[str, list[list[int]]]) -> int:
     return max((value for face_counts in counts.values() for row in face_counts for value in row), default=0)
 
@@ -710,13 +730,15 @@ def compute_face_layout(
 
 
 class PhoneSetCanvas(ttk.Frame):
-    def __init__(self, parent: tk.Widget) -> None:
+    def __init__(self, parent: tk.Widget, cell_click_callback=None) -> None:
         super().__init__(parent)
         self.counts = make_empty_counts()
         self.max_value = 0
+        self.cell_click_callback = cell_click_callback
         self.canvas = tk.Canvas(self, bg="#f1f5f9", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _event: self.draw())
+        self.canvas.bind("<Button-1>", self.on_click)
 
     def set_counts(self, counts: dict[str, list[list[int]]]) -> None:
         self.counts = counts
@@ -771,6 +793,199 @@ class PhoneSetCanvas(ttk.Frame):
         self.canvas.create_rectangle(rect.x1 + 2, rect.y1 + 2, rect.x1 + 36, rect.y1 + 20, fill="#ffffff", outline="")
         self.canvas.create_text(rect.x1 + 7, rect.y1 + 5, text=face, anchor="nw", fill="#0f172a", font=("", 9, "bold"))
 
+    def on_click(self, event: tk.Event) -> None:
+        if self.cell_click_callback is None:
+            return
+        cell = self.hit_test(event.x, event.y)
+        if cell is None:
+            return
+        face, row, col = cell
+        if self.counts[face][row][col] <= 0:
+            return
+        self.cell_click_callback(face, row, col)
+
+    def hit_test(self, x: int, y: int) -> tuple[str, int, int] | None:
+        width = max(self.canvas.winfo_width(), 1)
+        height = max(self.canvas.winfo_height(), 1)
+        layout = compute_face_layout(width, height)
+        for face in FACE_DRAW_ORDER:
+            rect = layout[face]
+            if not (rect.x1 <= x <= rect.x2 and rect.y1 <= y <= rect.y2):
+                continue
+            rows, cols = GRID_SHAPES[face]
+            col = min(cols - 1, max(0, int((x - rect.x1) / (rect.width / cols))))
+            row = min(rows - 1, max(0, int((y - rect.y1) / (rect.height / rows))))
+            return face, row, col
+        return None
+
+
+class PatchViewerWindow(tk.Toplevel):
+    def __init__(self, parent: tk.Tk) -> None:
+        super().__init__(parent)
+        self.title("Patch Viewer")
+        self.geometry("1180x720")
+        self.minsize(900, 560)
+        self.withdraw()
+        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+
+        self.patches: list[PatchImage] = []
+        self.patch_by_iid: dict[str, PatchImage] = {}
+        self.image_refs: list[tk.PhotoImage] = []
+        self.info_var = tk.StringVar(value="No patch selected")
+
+        root = ttk.Frame(self, padding=10)
+        root.pack(fill="both", expand=True)
+
+        columns = ("imei", "face", "category", "row", "col", "type", "vector", "time")
+        self.tree = ttk.Treeview(root, columns=columns, show="headings", height=8)
+        headings = {
+            "imei": "IMEI",
+            "face": "Face",
+            "category": "Category",
+            "row": "Row",
+            "col": "Col",
+            "type": "Type",
+            "vector": "Vector",
+            "time": "Time",
+        }
+        widths = {"imei": 170, "face": 52, "category": 76, "row": 52, "col": 52, "type": 150, "vector": 64, "time": 72}
+        for column in columns:
+            self.tree.heading(column, text=headings[column])
+            self.tree.column(column, width=widths[column], anchor="center")
+        self.tree.pack(fill="x")
+        self.tree.bind("<<TreeviewSelect>>", self.on_patch_select)
+
+        ttk.Label(root, textvariable=self.info_var, anchor="w").pack(fill="x", pady=(6, 8))
+
+        image_area = ttk.Frame(root)
+        image_area.pack(fill="both", expand=True)
+        image_area.columnconfigure(0, weight=1)
+        image_area.columnconfigure(1, weight=1)
+        image_area.rowconfigure(1, weight=1)
+
+        ttk.Label(image_area, text="Patch Image", font=("", 10, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(image_area, text="Original Patch", font=("", 10, "bold")).grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        self.patch_image_label = ttk.Label(image_area, anchor="center", relief="sunken")
+        self.original_image_label = ttk.Label(image_area, anchor="center", relief="sunken")
+        self.patch_image_label.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+        self.original_image_label.grid(row=1, column=1, sticky="nsew", padx=(10, 0), pady=(4, 0))
+
+        self.patch_path_var = tk.StringVar(value="")
+        self.original_path_var = tk.StringVar(value="")
+        ttk.Label(image_area, textvariable=self.patch_path_var, anchor="w").grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(image_area, textvariable=self.original_path_var, anchor="w").grid(
+            row=2,
+            column=1,
+            sticky="ew",
+            padx=(10, 0),
+            pady=(4, 0),
+        )
+
+    def show_patches(self, panel_title: str, patches: list[PatchImage]) -> None:
+        self.deiconify()
+        self.lift()
+        self.patches = sorted(patches, key=patch_sort_key)
+        self.patch_by_iid.clear()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        self.title(f"Patch Viewer - {panel_title}")
+        for index, patch in enumerate(self.patches):
+            iid = str(index)
+            self.patch_by_iid[iid] = patch
+            self.tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    patch.imei,
+                    patch.face,
+                    patch.category,
+                    patch.row,
+                    patch.col,
+                    patch.defect_type,
+                    patch.vector,
+                    patch.hhmmss,
+                ),
+            )
+
+        if self.patches:
+            self.tree.selection_set("0")
+            self.tree.focus("0")
+            self.display_patch(self.patches[0])
+        else:
+            self.clear_images("No patches in selected cell")
+
+    def on_patch_select(self, _event: tk.Event) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            return
+        patch = self.patch_by_iid.get(selected[0])
+        if patch is not None:
+            self.display_patch(patch)
+
+    def display_patch(self, patch: PatchImage) -> None:
+        self.info_var.set(
+            f"{patch.day_folder} {patch.hhmmss} | IMEI={patch.imei} | model={patch.model_file} | "
+            f"color={patch.color_code} | {patch.face}[{patch.row}][{patch.col}] | {patch.category}"
+        )
+        self.patch_path_var.set(str(patch.path))
+        original_path = patch.original_patch.path if patch.original_patch is not None else None
+        self.original_path_var.set(str(original_path) if original_path is not None else "No original patch metadata")
+
+        self.image_refs.clear()
+        self._set_image(self.patch_image_label, patch.path, "Patch image not available")
+        self._set_image(self.original_image_label, original_path, "Original patch not available")
+
+    def clear_images(self, message: str) -> None:
+        self.info_var.set(message)
+        self.patch_path_var.set("")
+        self.original_path_var.set("")
+        self.image_refs.clear()
+        for label in (self.patch_image_label, self.original_image_label):
+            label.configure(image="", text=message)
+
+    def _set_image(self, label: ttk.Label, path: Path | None, missing_text: str) -> None:
+        image, message = self._load_photo_image(path)
+        if image is None:
+            label.configure(image="", text=message or missing_text)
+            return
+        self.image_refs.append(image)
+        label.configure(image=image, text="")
+
+    def _load_photo_image(
+        self,
+        path: Path | None,
+        max_size: tuple[int, int] = (520, 460),
+    ) -> tuple[tk.PhotoImage | None, str]:
+        if path is None:
+            return None, "No original patch metadata"
+        try:
+            if not path.is_file():
+                return None, "Image file not found"
+        except OSError as exc:
+            return None, f"Image stat failed: {type(exc).__name__}"
+
+        try:
+            if Image is not None and ImageTk is not None:
+                with Image.open(path) as image:
+                    resampling = getattr(Image, "Resampling", Image)
+                    image.thumbnail(max_size, getattr(resampling, "LANCZOS", 1))
+                    return ImageTk.PhotoImage(image.copy()), ""
+
+            image = tk.PhotoImage(file=str(path))
+            factor = max(
+                1,
+                (image.width() + max_size[0] - 1) // max_size[0],
+                (image.height() + max_size[1] - 1) // max_size[1],
+            )
+            if factor > 1:
+                image = image.subsample(factor, factor)
+            return image, ""
+        except Exception as exc:
+            return None, f"Image load failed: {type(exc).__name__}"
+
 
 class SetVisualizerApp(tk.Tk):
     def __init__(self) -> None:
@@ -800,6 +1015,7 @@ class SetVisualizerApp(tk.Tk):
         self.panel_scan_keys: dict[str, tuple[str, tuple[tuple[str, str], ...]] | None] = {
             key: None for key in PANEL_KEYS
         }
+        self.patch_viewer: PatchViewerWindow | None = None
 
         self._build_ui()
         self._set_date_controls_enabled(False)
@@ -898,7 +1114,10 @@ class SetVisualizerApp(tk.Tk):
         self.date_combos[key] = date_combo
         self.apply_buttons[key] = apply_button
 
-        canvas = PhoneSetCanvas(panel)
+        canvas = PhoneSetCanvas(
+            panel,
+            cell_click_callback=lambda face, row, col, panel_key=key: self.on_cell_click(panel_key, face, row, col),
+        )
         canvas.pack(fill="both", expand=True)
         self.canvases[key] = canvas
 
@@ -1147,6 +1366,24 @@ class SetVisualizerApp(tk.Tk):
             return
         self.imei_var.set(values[0])
         self.refresh_visuals()
+
+    def on_cell_click(self, key: str, face: str, row: int, col: int) -> None:
+        patches = [
+            patch
+            for patch in self.current_filtered_patches(key)
+            if patch.face == face and patch.row == row and patch.col == col
+        ]
+        if not patches:
+            return
+        if self.patch_viewer is None or not self.patch_viewer.winfo_exists():
+            self.patch_viewer = PatchViewerWindow(self)
+        selected = self.date_options.get(self.date_vars[key].get(), "-")
+        self.patch_viewer.show_patches(f"{PANEL_TITLES[key]} {selected} {face}[{row}][{col}]", patches)
+
+    def current_filtered_patches(self, key: str) -> list[PatchImage]:
+        category = self.category_var.get() or ALL_VALUE
+        imei = self.imei_var.get() or ALL_VALUE
+        return filter_patches(self.panel_patches[key], category, imei)
 
     def _set_date_controls_enabled(self, enabled: bool) -> None:
         combo_state = "readonly" if enabled else "disabled"

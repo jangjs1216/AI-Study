@@ -386,6 +386,41 @@ def normalize_category_name(value: str) -> str | None:
     return CATEGORY_LOOKUP.get(value.strip().lower())
 
 
+def safe_is_dir(path: Path, errors: Counter[str], error_key: str) -> bool:
+    try:
+        return path.is_dir()
+    except OSError:
+        errors[error_key] += 1
+        return False
+
+
+def safe_is_file(path: Path, errors: Counter[str], error_key: str) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        errors[error_key] += 1
+        return False
+
+
+def safe_list_files(folder: Path, errors: Counter[str], error_key: str) -> list[Path]:
+    try:
+        return [path for path in folder.iterdir() if safe_is_file(path, errors, error_key)]
+    except OSError:
+        errors[error_key] += 1
+        return []
+
+
+def safe_rglob_files(folder: Path, errors: Counter[str], error_key: str) -> list[Path]:
+    files: list[Path] = []
+    try:
+        for path in folder.rglob("*"):
+            if safe_is_file(path, errors, error_key):
+                files.append(path)
+    except OSError:
+        errors[error_key] += 1
+    return files
+
+
 def scan_date_folders(root_paths: dict[str, Path]) -> tuple[list[DateFolder], Counter[str]]:
     folders: list[DateFolder] = []
     errors: Counter[str] = Counter()
@@ -451,11 +486,11 @@ def scan_patches(root_paths: dict[str, Path], selected_yymmdd: str) -> ScanResul
         for future in as_completed(futures):
             try:
                 worker_patches, worker_errors = future.result()
-            except OSError:
-                errors["scan worker os error"] += 1
+            except OSError as exc:
+                errors[f"scan worker os error: {type(exc).__name__}"] += 1
                 continue
-            except Exception:
-                errors["scan worker error"] += 1
+            except Exception as exc:
+                errors[f"scan worker error: {type(exc).__name__}"] += 1
                 continue
             patches.extend(worker_patches)
             errors.update(worker_errors)
@@ -486,11 +521,11 @@ def _scan_inspection_patches(
     category_dirs: dict[str, Path] = {}
     direct_files: list[Path] = []
     for child in inspection_children:
-        if child.is_dir():
+        if safe_is_dir(child, errors, "inspection child stat error"):
             category = normalize_category_name(child.name)
             if category is not None:
                 category_dirs[category] = child
-        elif child.is_file():
+        elif safe_is_file(child, errors, "inspection child stat error"):
             direct_files.append(child)
 
     for category in CATEGORIES:
@@ -498,18 +533,10 @@ def _scan_inspection_patches(
         if category_dir is None:
             continue
 
-        try:
-            category_files = [path for path in category_dir.iterdir() if path.is_file()]
-        except OSError:
-            errors[f"{category}: read error"] += 1
-            continue
+        category_files = safe_list_files(category_dir, errors, f"{category}: read error")
 
         if not category_files:
-            try:
-                category_files = [path for path in category_dir.rglob("*") if path.is_file()]
-            except OSError:
-                errors[f"{category}: recursive read error"] += 1
-                continue
+            category_files = safe_rglob_files(category_dir, errors, f"{category}: recursive read error")
 
         for path in category_files:
             patch = _build_patch_image(root_slot, day_folder, inspection, path, errors, category)

@@ -235,10 +235,11 @@ GRID_SHAPES = {
 - UI 면 비율 표기는 `width x height` 기준이다.
 - grid 배열은 기존 `side_row_col_visualizer.py`처럼 `rows x cols`로 둔다.
 - 그래서 `A`, `C`는 `31 rows x 20 cols`가 된다.
-- 파일명 좌표와 UI grid 좌표는 face별로 다르게 해석한다.
-  - `A`, `C`: 파일명 `[row][col]`을 그대로 UI `[row][col]`로 사용한다.
-  - `BT`, `BB`: 파일명 `[0~1][0~20]`을 그대로 UI `[row][col]`로 사용한다.
-  - `BL`, `BR`: 파일명 `[0~1][0~30]`에서 첫 값은 가로 위치, 둘째 값은 세로 위치다. UI에는 `[row=둘째 값][col=첫 값]`으로 변환한다.
+- 파일명 좌표는 모든 face에서 `[x][y]`로 해석한다.
+  - UI grid에는 항상 `[row=y][col=x]`로 변환한다.
+  - `A`, `C`: 파일명 `[0~19][0~30]`을 UI `31 rows x 20 cols`로 변환한다.
+  - `BL`, `BR`: 파일명 `[0~1][0~30]`을 UI `31 rows x 2 cols`로 변환한다.
+  - `BT`, `BB`: 파일명 `[0~20][0~1]`을 UI `2 rows x 21 cols`로 변환한다.
 
 집계 모드:
 
@@ -264,6 +265,8 @@ GRID_SHAPES = {
 - `BT/BB` 경로 선택
 - `C` 경로 선택
 - `완료` 버튼
+- `완료` 버튼을 누르면 4개 root 경로를 사용자 설정 파일에 저장한다.
+- 프로그램 시작 시 저장된 root 경로가 있으면 입력칸에 자동 복원하고 날짜 목록을 자동 로드한다.
 
 날짜/필터 영역:
 
@@ -316,6 +319,12 @@ GRID_SHAPES = {
 2. 존재하지 않는 경로는 경고한다.
 3. 존재하는 경로에서 `^\d{6}$` 날짜 폴더를 찾는다.
 4. 날짜 목록을 병합해 UI에 표시한다.
+5. root 경로 4개를 로컬 설정 파일에 저장한다.
+
+설정 파일 위치:
+
+- Windows: `%APPDATA%/SetVisualizer/config.json`
+- 그 외 또는 `APPDATA`가 없을 때: `~/.set_visualizer/config.json`
 
 ### 2. 날짜 적용
 
@@ -331,7 +340,18 @@ GRID_SHAPES = {
 8. 선택된 표시 모드와 필터에 맞춰 grid counts를 만든다.
 9. canvas를 다시 그린다.
 
-### 3. 패치 표시
+### 3. 중복 탐색 및 병렬화
+
+`Apply` 동작은 다음 성능 전략을 따른다.
+
+1. 루트 경로 4개와 선택 날짜를 묶은 cache key를 만든다.
+2. 동일한 cache key의 결과가 이미 있으면 파일 시스템을 다시 보지 않고 캐시된 `ScanResult`를 사용한다.
+3. 동일한 cache key가 이미 스캔 중이면 새 스캔을 만들지 않고 기존 스캔 완료를 기다린다.
+4. 새 스캔이 필요한 경우 UI thread가 아니라 background thread에서 실행한다.
+5. background scan 내부에서는 검사 폴더 단위 작업을 thread pool에 분배한다.
+6. `Defects`, `Refined`, `Filtered` 폴더는 현재 구조상 이미지가 바로 들어 있다고 보고 recursive scan 대신 직접 하위 파일만 조회한다.
+
+### 4. 패치 표시
 
 각 face panel은 다음 순서로 그린다.
 

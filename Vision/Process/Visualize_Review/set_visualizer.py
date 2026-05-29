@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
+import threading
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -28,6 +31,14 @@ MODE_TOTAL_PATCHES = "Total patches"
 MODE_UNIQUE_IMEI = "Unique IMEI count"
 PANEL_KEYS = ("left", "right")
 PANEL_TITLES = {"left": "Left date", "right": "Right date"}
+MAX_SCAN_WORKERS = min(32, max(4, (os.cpu_count() or 4) * 2))
+
+
+def default_config_path() -> Path:
+    base = os.environ.get("APPDATA")
+    if base:
+        return Path(base) / "SetVisualizer" / "config.json"
+    return Path.home() / ".set_visualizer" / "config.json"
 
 FACE_UNITS = {
     "BL": (2, 31),
@@ -46,12 +57,12 @@ GRID_SHAPES = {
     "BB": (2, 21),
 }
 FILE_COORD_LIMITS = {
-    "A": (30, 19),
-    "C": (30, 19),
+    "A": (19, 30),
+    "C": (19, 30),
     "BL": (1, 30),
     "BR": (1, 30),
-    "BT": (1, 20),
-    "BB": (1, 20),
+    "BT": (20, 1),
+    "BB": (20, 1),
 }
 PANEL_COLORS = {
     "A": "#f8fafc",
@@ -138,6 +149,46 @@ class ScanResult:
     missing_faces: tuple[str, ...]
 
 
+def normalize_path_for_cache(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def make_scan_cache_key(root_paths: dict[str, Path], selected_yymmdd: str) -> tuple[str, tuple[tuple[str, str], ...]]:
+    roots = tuple((root_slot, normalize_path_for_cache(root_paths[root_slot])) for root_slot in ROOT_SLOTS)
+    return selected_yymmdd, roots
+
+
+def load_saved_roots(config_path: Path | None = None) -> dict[str, str]:
+    path = config_path or default_config_path()
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    roots = payload.get("roots")
+    if not isinstance(roots, dict):
+        return {}
+    return {
+        root_slot: str(roots.get(root_slot, "")).strip()
+        for root_slot in ROOT_SLOTS
+        if str(roots.get(root_slot, "")).strip()
+    }
+
+
+def save_roots(root_paths: dict[str, Path], config_path: Path | None = None) -> bool:
+    path = config_path or default_config_path()
+    payload = {"roots": {root_slot: str(root_paths[root_slot]) for root_slot in ROOT_SLOTS}}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+    except OSError:
+        return False
+    return True
+
+
 def parse_date_folder_name(name: str) -> date | None:
     if not DATE_FOLDER_RE.fullmatch(name):
         return None
@@ -191,16 +242,12 @@ def parse_patch_filename(name: str, category: str | None = None) -> PatchMeta | 
 
 
 def to_display_cell(face: str, meta: PatchMeta) -> tuple[int, int] | None:
-    max_file_row, max_file_col = FILE_COORD_LIMITS[face]
-    if not (0 <= meta.row <= max_file_row and 0 <= meta.col <= max_file_col):
+    max_file_x, max_file_y = FILE_COORD_LIMITS[face]
+    if not (0 <= meta.row <= max_file_x and 0 <= meta.col <= max_file_y):
         return None
 
-    if face in {"BL", "BR"}:
-        display_row = meta.col
-        display_col = meta.row
-    else:
-        display_row = meta.row
-        display_col = meta.col
+    display_row = meta.col
+    display_col = meta.row
 
     row_count, col_count = GRID_SHAPES[face]
     if not (0 <= display_row < row_count and 0 <= display_col < col_count):
@@ -261,26 +308,48 @@ def scan_patches(root_paths: dict[str, Path], selected_yymmdd: str) -> ScanResul
     errors: Counter[str] = Counter()
     missing_roots: list[str] = []
     inspections = 0
+    futures = []
 
-    for root_slot, root in root_paths.items():
-        date_path = root / selected_yymmdd
-        if not date_path.is_dir():
-            missing_roots.append(root_slot)
-            continue
-
-        try:
-            inspection_dirs = [path for path in date_path.iterdir() if path.is_dir()]
-        except OSError:
-            errors[f"{root_slot}: date read error"] += 1
-            continue
-
-        for inspection_dir in inspection_dirs:
-            inspection = parse_inspection_folder_name(inspection_dir.name)
-            if inspection is None:
-                errors["invalid inspection folder"] += 1
+    with ThreadPoolExecutor(max_workers=MAX_SCAN_WORKERS) as executor:
+        for root_slot, root in root_paths.items():
+            date_path = root / selected_yymmdd
+            if not date_path.is_dir():
+                missing_roots.append(root_slot)
                 continue
-            inspections += 1
-            patches.extend(_scan_inspection_patches(root_slot, selected_yymmdd, inspection_dir, inspection, errors))
+
+            try:
+                inspection_dirs = [path for path in date_path.iterdir() if path.is_dir()]
+            except OSError:
+                errors[f"{root_slot}: date read error"] += 1
+                continue
+
+            for inspection_dir in inspection_dirs:
+                inspection = parse_inspection_folder_name(inspection_dir.name)
+                if inspection is None:
+                    errors["invalid inspection folder"] += 1
+                    continue
+                inspections += 1
+                futures.append(
+                    executor.submit(
+                        _scan_inspection_patches,
+                        root_slot,
+                        selected_yymmdd,
+                        inspection_dir,
+                        inspection,
+                    )
+                )
+
+        for future in as_completed(futures):
+            try:
+                worker_patches, worker_errors = future.result()
+            except OSError:
+                errors["scan worker os error"] += 1
+                continue
+            except Exception:
+                errors["scan worker error"] += 1
+                continue
+            patches.extend(worker_patches)
+            errors.update(worker_errors)
 
     return ScanResult(
         patches=patches,
@@ -295,9 +364,9 @@ def _scan_inspection_patches(
     day_folder: str,
     inspection_dir: Path,
     inspection: InspectionMeta,
-    errors: Counter[str],
-) -> list[PatchImage]:
+) -> tuple[list[PatchImage], Counter[str]]:
     patches: list[PatchImage] = []
+    errors: Counter[str] = Counter()
 
     for category in CATEGORIES:
         category_dir = inspection_dir / category
@@ -308,7 +377,7 @@ def _scan_inspection_patches(
             continue
 
         try:
-            category_files = [path for path in category_dir.rglob("*") if path.is_file()]
+            category_files = [path for path in category_dir.iterdir() if path.is_file()]
         except OSError:
             errors[f"{category}: read error"] += 1
             continue
@@ -329,7 +398,7 @@ def _scan_inspection_patches(
         if patch is not None:
             patches.append(patch)
 
-    return patches
+    return patches, errors
 
 
 def _build_patch_image(
@@ -573,10 +642,16 @@ class SetVisualizerApp(tk.Tk):
         self.apply_buttons: dict[str, ttk.Button] = {}
         self.canvases: dict[str, PhoneSetCanvas] = {}
         self.summary_trees: dict[str, ttk.Treeview] = {}
+        self.scan_cache: dict[tuple[str, tuple[tuple[str, str], ...]], ScanResult] = {}
+        self.pending_scan_panels: dict[tuple[str, tuple[tuple[str, str], ...]], set[str]] = {}
+        self.panel_scan_keys: dict[str, tuple[str, tuple[tuple[str, str], ...]] | None] = {
+            key: None for key in PANEL_KEYS
+        }
 
         self._build_ui()
         self._set_date_controls_enabled(False)
         self._set_filter_controls_enabled(False)
+        self.restore_saved_roots()
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=12)
@@ -719,10 +794,26 @@ class SetVisualizerApp(tk.Tk):
             return None
         return roots
 
+    def restore_saved_roots(self) -> None:
+        saved_roots = load_saved_roots()
+        if not saved_roots:
+            return
+        for root_slot, path_text in saved_roots.items():
+            self.root_vars[root_slot].set(path_text)
+        if all(self.root_vars[root_slot].get().strip() for root_slot in ROOT_SLOTS):
+            self.status_var.set("Loaded saved image roots")
+            self.after(150, self.load_dates)
+
     def load_dates(self) -> None:
         roots = self.get_root_paths()
         if roots is None:
             return
+
+        saved = save_roots(roots)
+        self.scan_cache.clear()
+        self.pending_scan_panels.clear()
+        for key in PANEL_KEYS:
+            self.panel_scan_keys[key] = None
 
         folders, errors = scan_date_folders(roots)
         by_folder: dict[str, date] = {}
@@ -750,6 +841,8 @@ class SetVisualizerApp(tk.Tk):
 
         if errors:
             self.status_var.set(f"{self.status_var.get()} | {self.format_errors(errors)}")
+        if not saved:
+            self.status_var.set(f"{self.status_var.get()} | root save failed")
 
     def apply_panel_date(self, key: str) -> None:
         roots = self.get_root_paths()
@@ -760,14 +853,81 @@ class SetVisualizerApp(tk.Tk):
             messagebox.showwarning("Missing date", "Select a date folder first")
             return
 
-        result = scan_patches(roots, selected)
-        self.panel_patches[key] = result.patches
-        self.panel_errors[key] = result.errors
-        self.panel_missing_faces[key] = result.missing_faces
-        self.panel_inspections[key] = result.inspections
-        self.populate_imei_choices()
-        self._set_filter_controls_enabled(True)
-        self.refresh_visuals()
+        cache_key = make_scan_cache_key(roots, selected)
+        self.panel_scan_keys[key] = cache_key
+        cached = self.scan_cache.get(cache_key)
+        if cached is not None:
+            self.apply_scan_result((key,), cached)
+            self.status_var.set(f"Loaded {selected} from cache")
+            return
+
+        if cache_key in self.pending_scan_panels:
+            self.pending_scan_panels[cache_key].add(key)
+            self.apply_buttons[key].configure(state="disabled")
+            self.status_var.set(f"Waiting for existing scan: {selected}")
+            return
+
+        self.pending_scan_panels[cache_key] = {key}
+        self.apply_buttons[key].configure(state="disabled")
+        self.status_var.set(f"Scanning {selected} with up to {MAX_SCAN_WORKERS} workers...")
+        thread = threading.Thread(
+            target=self.scan_panel_worker,
+            args=(cache_key, roots, selected),
+            daemon=True,
+        )
+        thread.start()
+
+    def scan_panel_worker(
+        self,
+        cache_key: tuple[str, tuple[tuple[str, str], ...]],
+        roots: dict[str, Path],
+        selected: str,
+    ) -> None:
+        try:
+            result = scan_patches(roots, selected)
+            error: Exception | None = None
+        except Exception as exc:
+            result = ScanResult(patches=[], inspections=0, errors=Counter({"scan failed": 1}), missing_faces=())
+            error = exc
+        try:
+            self.after(0, lambda: self.finish_panel_scan(cache_key, result, error))
+        except RuntimeError:
+            return
+
+    def finish_panel_scan(
+        self,
+        cache_key: tuple[str, tuple[tuple[str, str], ...]],
+        result: ScanResult,
+        error: Exception | None,
+    ) -> None:
+        panels = self.pending_scan_panels.pop(cache_key, None)
+        if panels is None:
+            return
+        if error is None:
+            self.scan_cache[cache_key] = result
+        active_panels = tuple(panel for panel in panels if self.panel_scan_keys.get(panel) == cache_key)
+        self.apply_scan_result(active_panels, result)
+        for panel in panels:
+            self.apply_buttons[panel].configure(state="normal")
+
+        selected = cache_key[0]
+        if error is not None:
+            self.status_var.set(f"Scan failed for {selected}: {error}")
+        else:
+            self.status_var.set(
+                f"Scan complete for {selected}: inspections={result.inspections:,}, patches={len(result.patches):,}"
+            )
+
+    def apply_scan_result(self, panels: tuple[str, ...], result: ScanResult) -> None:
+        for panel in panels:
+            self.panel_patches[panel] = result.patches
+            self.panel_errors[panel] = result.errors
+            self.panel_missing_faces[panel] = result.missing_faces
+            self.panel_inspections[panel] = result.inspections
+        if panels:
+            self.populate_imei_choices()
+            self._set_filter_controls_enabled(True)
+            self.refresh_visuals()
 
     def populate_imei_choices(self) -> None:
         current = self.imei_var.get()
@@ -863,6 +1023,7 @@ def run_self_test() -> None:
 
     assert parse_date_folder_name("260528") == date(2026, 5, 28)
     assert parse_date_folder_name("260230") is None
+    assert load_saved_roots(Path("__missing_set_visualizer_config__.json")) == {}
     inspection = parse_inspection_folder_name("122850_ABC1234567890_SM-S948-SMART_COSMETIC_V26.03.10.0_ZW")
     assert inspection is not None
     assert inspection.hhmmss == "122850"
@@ -872,6 +1033,7 @@ def run_self_test() -> None:
 
     patch = parse_patch_filename("[0][9][C_Center][0].png", "Defects")
     assert patch == PatchMeta(category="Defects", row=0, col=9, defect_type="C_Center", vector="0")
+    assert to_display_cell("A", patch) == (9, 0)
     prefix_patch = parse_patch_filename("Filtered[1][1][B_Top][0].png")
     assert prefix_patch == PatchMeta(category="Filtered", row=1, col=1, defect_type="B_Top", vector="0")
     bl_patch = parse_patch_filename("[1][30][BLeft_Bottom][0].png", "Defects")
@@ -882,11 +1044,11 @@ def run_self_test() -> None:
     assert br_patch is not None
     assert face_from_patch_type("BL/BR", br_patch.defect_type) == "BR"
     assert to_display_cell("BR", br_patch) == (23, 0)
-    bt_patch = parse_patch_filename("[1][20][BTop_Right][0].png", "Refined")
+    bt_patch = parse_patch_filename("[20][1][BTop_Right][0].png", "Refined")
     assert bt_patch is not None
     assert face_from_patch_type("BT/BB", bt_patch.defect_type) == "BT"
     assert to_display_cell("BT", bt_patch) == (1, 20)
-    bb_patch = parse_patch_filename("[0][12][BBottom_Left][0].png", "Filtered")
+    bb_patch = parse_patch_filename("[12][0][BBottom_Left][0].png", "Filtered")
     assert bb_patch is not None
     assert face_from_patch_type("BT/BB", bb_patch.defect_type) == "BB"
     assert face_from_patch_type("BL/BR", bt_patch.defect_type) is None

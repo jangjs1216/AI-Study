@@ -14,6 +14,13 @@ from tkinter import filedialog, messagebox, ttk
 
 
 FACES = ("A", "BL", "BT", "BB", "BR", "C")
+ROOT_SLOTS = ("A", "BL/BR", "BT/BB", "C")
+ROOT_SLOT_LABELS = {
+    "A": "A",
+    "BL/BR": "BL / BR",
+    "BT/BB": "BT / BB",
+    "C": "C",
+}
 FACE_DRAW_ORDER = ("BT", "BL", "A", "BB", "BR", "C")
 CATEGORIES = ("Defects", "Refined", "Filtered")
 ALL_VALUE = "All"
@@ -84,7 +91,7 @@ class Rect:
 
 @dataclass(frozen=True)
 class DateFolder:
-    face: str
+    root_slot: str
     folder_name: str
     day: date
     path: Path
@@ -201,18 +208,40 @@ def to_display_cell(face: str, meta: PatchMeta) -> tuple[int, int] | None:
     return display_row, display_col
 
 
-def scan_date_folders(face_roots: dict[str, Path]) -> tuple[list[DateFolder], Counter[str]]:
+def normalize_type_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def face_from_patch_type(root_slot: str, defect_type: str) -> str | None:
+    if root_slot in {"A", "C"}:
+        return root_slot
+
+    type_key = normalize_type_key(defect_type)
+    if root_slot == "BL/BR":
+        if type_key.startswith("bleft"):
+            return "BL"
+        if type_key.startswith("bright"):
+            return "BR"
+    elif root_slot == "BT/BB":
+        if type_key.startswith("btop"):
+            return "BT"
+        if type_key.startswith("bbottom"):
+            return "BB"
+    return None
+
+
+def scan_date_folders(root_paths: dict[str, Path]) -> tuple[list[DateFolder], Counter[str]]:
     folders: list[DateFolder] = []
     errors: Counter[str] = Counter()
 
-    for face, root in face_roots.items():
+    for root_slot, root in root_paths.items():
         if not root.is_dir():
-            errors[f"{face}: missing root"] += 1
+            errors[f"{root_slot}: missing root"] += 1
             continue
         try:
             children = list(root.iterdir())
         except OSError:
-            errors[f"{face}: root read error"] += 1
+            errors[f"{root_slot}: root read error"] += 1
             continue
 
         for child in children:
@@ -221,28 +250,28 @@ def scan_date_folders(face_roots: dict[str, Path]) -> tuple[list[DateFolder], Co
             parsed_day = parse_date_folder_name(child.name)
             if parsed_day is None:
                 continue
-            folders.append(DateFolder(face=face, folder_name=child.name, day=parsed_day, path=child))
+            folders.append(DateFolder(root_slot=root_slot, folder_name=child.name, day=parsed_day, path=child))
 
-    folders.sort(key=lambda item: (item.day, item.face))
+    folders.sort(key=lambda item: (item.day, item.root_slot))
     return folders, errors
 
 
-def scan_patches(face_roots: dict[str, Path], selected_yymmdd: str) -> ScanResult:
+def scan_patches(root_paths: dict[str, Path], selected_yymmdd: str) -> ScanResult:
     patches: list[PatchImage] = []
     errors: Counter[str] = Counter()
-    missing_faces: list[str] = []
+    missing_roots: list[str] = []
     inspections = 0
 
-    for face, root in face_roots.items():
+    for root_slot, root in root_paths.items():
         date_path = root / selected_yymmdd
         if not date_path.is_dir():
-            missing_faces.append(face)
+            missing_roots.append(root_slot)
             continue
 
         try:
             inspection_dirs = [path for path in date_path.iterdir() if path.is_dir()]
         except OSError:
-            errors[f"{face}: date read error"] += 1
+            errors[f"{root_slot}: date read error"] += 1
             continue
 
         for inspection_dir in inspection_dirs:
@@ -251,18 +280,18 @@ def scan_patches(face_roots: dict[str, Path], selected_yymmdd: str) -> ScanResul
                 errors["invalid inspection folder"] += 1
                 continue
             inspections += 1
-            patches.extend(_scan_inspection_patches(face, selected_yymmdd, inspection_dir, inspection, errors))
+            patches.extend(_scan_inspection_patches(root_slot, selected_yymmdd, inspection_dir, inspection, errors))
 
     return ScanResult(
         patches=patches,
         inspections=inspections,
         errors=errors,
-        missing_faces=tuple(missing_faces),
+        missing_faces=tuple(missing_roots),
     )
 
 
 def _scan_inspection_patches(
-    face: str,
+    root_slot: str,
     day_folder: str,
     inspection_dir: Path,
     inspection: InspectionMeta,
@@ -285,7 +314,7 @@ def _scan_inspection_patches(
             continue
 
         for path in category_files:
-            patch = _build_patch_image(face, day_folder, inspection, path, errors, category)
+            patch = _build_patch_image(root_slot, day_folder, inspection, path, errors, category)
             if patch is not None:
                 patches.append(patch)
 
@@ -296,7 +325,7 @@ def _scan_inspection_patches(
         direct_files = []
 
     for path in direct_files:
-        patch = _build_patch_image(face, day_folder, inspection, path, errors, None)
+        patch = _build_patch_image(root_slot, day_folder, inspection, path, errors, None)
         if patch is not None:
             patches.append(patch)
 
@@ -304,7 +333,7 @@ def _scan_inspection_patches(
 
 
 def _build_patch_image(
-    face: str,
+    root_slot: str,
     day_folder: str,
     inspection: InspectionMeta,
     path: Path,
@@ -318,6 +347,11 @@ def _build_patch_image(
     meta = parse_patch_filename(path.name, category)
     if meta is None:
         errors["invalid patch filename"] += 1
+        return None
+
+    face = face_from_patch_type(root_slot, meta.defect_type)
+    if face is None:
+        errors["patch type root mismatch"] += 1
         return None
 
     display_cell = to_display_cell(face, meta)
@@ -523,7 +557,7 @@ class SetVisualizerApp(tk.Tk):
         self.geometry("1720x900")
         self.minsize(1280, 760)
 
-        self.root_vars = {face: tk.StringVar() for face in FACES}
+        self.root_vars = {root_slot: tk.StringVar() for root_slot in ROOT_SLOTS}
         self.date_vars = {key: tk.StringVar() for key in PANEL_KEYS}
         self.category_var = tk.StringVar(value=ALL_VALUE)
         self.mode_var = tk.StringVar(value=MODE_TOTAL_PATCHES)
@@ -548,20 +582,26 @@ class SetVisualizerApp(tk.Tk):
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
 
-        path_frame = ttk.LabelFrame(root, text="Face roots", padding=8)
+        path_frame = ttk.LabelFrame(root, text="Image roots", padding=8)
         path_frame.pack(fill="x")
-        for index, face in enumerate(FACES):
+        for index, root_slot in enumerate(ROOT_SLOTS):
             row = index // 2
             col = (index % 2) * 3
-            ttk.Label(path_frame, text=face, width=4).grid(row=row, column=col, sticky="w", padx=(0, 4), pady=2)
-            ttk.Entry(path_frame, textvariable=self.root_vars[face]).grid(
+            ttk.Label(path_frame, text=ROOT_SLOT_LABELS[root_slot], width=7).grid(
+                row=row,
+                column=col,
+                sticky="w",
+                padx=(0, 4),
+                pady=2,
+            )
+            ttk.Entry(path_frame, textvariable=self.root_vars[root_slot]).grid(
                 row=row,
                 column=col + 1,
                 sticky="ew",
                 padx=(0, 4),
                 pady=2,
             )
-            ttk.Button(path_frame, text="Browse", command=lambda item=face: self.select_root(item)).grid(
+            ttk.Button(path_frame, text="Browse", command=lambda item=root_slot: self.select_root(item)).grid(
                 row=row,
                 column=col + 2,
                 sticky="ew",
@@ -657,27 +697,30 @@ class SetVisualizerApp(tk.Tk):
         ttk.Label(panel, textvariable=self.detail_vars[key], justify="left", anchor="nw").pack(fill="x")
         return panel
 
-    def select_root(self, face: str) -> None:
-        initial_dir = self.root_vars[face].get().strip() or str(Path.cwd())
-        selected = filedialog.askdirectory(title=f"Select {face} root", initialdir=initial_dir)
+    def select_root(self, root_slot: str) -> None:
+        initial_dir = self.root_vars[root_slot].get().strip() or str(Path.cwd())
+        selected = filedialog.askdirectory(
+            title=f"Select {ROOT_SLOT_LABELS[root_slot]} root",
+            initialdir=initial_dir,
+        )
         if selected:
-            self.root_vars[face].set(selected)
+            self.root_vars[root_slot].set(selected)
 
-    def get_face_roots(self) -> dict[str, Path] | None:
+    def get_root_paths(self) -> dict[str, Path] | None:
         roots: dict[str, Path] = {}
         missing = []
-        for face in FACES:
-            text = self.root_vars[face].get().strip()
+        for root_slot in ROOT_SLOTS:
+            text = self.root_vars[root_slot].get().strip()
             if not text:
-                missing.append(face)
-            roots[face] = Path(text)
+                missing.append(ROOT_SLOT_LABELS[root_slot])
+            roots[root_slot] = Path(text)
         if missing:
             messagebox.showwarning("Missing roots", f"Set root paths for: {', '.join(missing)}")
             return None
         return roots
 
     def load_dates(self) -> None:
-        roots = self.get_face_roots()
+        roots = self.get_root_paths()
         if roots is None:
             return
 
@@ -709,7 +752,7 @@ class SetVisualizerApp(tk.Tk):
             self.status_var.set(f"{self.status_var.get()} | {self.format_errors(errors)}")
 
     def apply_panel_date(self, key: str) -> None:
-        roots = self.get_face_roots()
+        roots = self.get_root_paths()
         if roots is None:
             return
         selected = self.date_options.get(self.date_vars[key].get())
@@ -775,7 +818,7 @@ class SetVisualizerApp(tk.Tk):
             f"max cell={max_count(counts):,}",
         ]
         if self.panel_missing_faces[key]:
-            details.append(f"missing faces={','.join(self.panel_missing_faces[key])}")
+            details.append(f"missing roots={','.join(self.panel_missing_faces[key])}")
         if self.panel_errors[key]:
             details.append(self.format_errors(self.panel_errors[key]))
         self.detail_vars[key].set(" | ".join(details) + "\n" + face_totals)
@@ -831,12 +874,22 @@ def run_self_test() -> None:
     assert patch == PatchMeta(category="Defects", row=0, col=9, defect_type="C_Center", vector="0")
     prefix_patch = parse_patch_filename("Filtered[1][1][B_Top][0].png")
     assert prefix_patch == PatchMeta(category="Filtered", row=1, col=1, defect_type="B_Top", vector="0")
-    bl_patch = parse_patch_filename("[1][30][B_Left][0].png", "Defects")
+    bl_patch = parse_patch_filename("[1][30][BLeft_Bottom][0].png", "Defects")
     assert bl_patch is not None
+    assert face_from_patch_type("BL/BR", bl_patch.defect_type) == "BL"
     assert to_display_cell("BL", bl_patch) == (30, 1)
-    bt_patch = parse_patch_filename("[1][20][B_Top][0].png", "Refined")
+    br_patch = parse_patch_filename("[0][23][BRight_Top][0].png", "Defects")
+    assert br_patch is not None
+    assert face_from_patch_type("BL/BR", br_patch.defect_type) == "BR"
+    assert to_display_cell("BR", br_patch) == (23, 0)
+    bt_patch = parse_patch_filename("[1][20][BTop_Right][0].png", "Refined")
     assert bt_patch is not None
+    assert face_from_patch_type("BT/BB", bt_patch.defect_type) == "BT"
     assert to_display_cell("BT", bt_patch) == (1, 20)
+    bb_patch = parse_patch_filename("[0][12][BBottom_Left][0].png", "Filtered")
+    assert bb_patch is not None
+    assert face_from_patch_type("BT/BB", bb_patch.defect_type) == "BB"
+    assert face_from_patch_type("BL/BR", bt_patch.defect_type) is None
     assert to_display_cell("BL", PatchMeta("Defects", 2, 30, "B_Left", "0")) is None
 
     sample_patches = [

@@ -2,7 +2,7 @@
 
 ## 목표
 
-`set_visualizer.py`는 CSV를 읽는 프로그램이 아니라, 사용자가 지정한 6개 면별 이미지 루트 경로에서 날짜, 장비/모델 정보, 패치 이미지를 수집해 스마트폰 전개도 UI에 표시하는 프로그램으로 만든다.
+`set_visualizer.py`는 CSV를 읽는 프로그램이 아니라, 사용자가 지정한 4개 이미지 루트 경로에서 날짜, 장비/모델 정보, 패치 이미지를 수집해 스마트폰 전개도 UI에 표시하는 프로그램으로 만든다.
 
 표시 대상 면은 다음 6개다.
 
@@ -21,22 +21,28 @@
 
 ## 전체 흐름
 
-1. 사용자가 `A`, `BL`, `BT`, `BB`, `BR`, `C` 각각에 해당하는 루트 경로를 지정한다.
+1. 사용자가 `A`, `BL/BR`, `BT/BB`, `C`에 해당하는 4개 루트 경로를 지정한다.
 2. 사용자가 `완료` 버튼을 누르면, 각 루트 경로 바로 아래의 날짜 폴더를 스캔한다.
 3. 날짜 폴더명은 `260520` 같은 `yymmdd` 형식으로 해석한다.
 4. UI에서 날짜 폴더를 선택하고 `적용` 버튼을 누른다.
-5. 선택한 날짜에 대해 6개 면의 날짜 폴더 내부를 스캔한다.
+5. 선택한 날짜에 대해 4개 루트의 날짜 폴더 내부를 스캔한다.
 6. 날짜 폴더 내부에는 검사 단위 폴더가 있으며, 폴더명에서 `hhmmss`, `IMEI`, `모델파일`, `ColorCode`를 수집한다.
 7. 각 검사 단위 폴더 안의 이미지 파일을 수집한다.
 8. 이미지 파일명에서 `row`, `col`, `Type`, `Vector`를 추출한다.
-9. 추출한 패치를 IMEI별, 면별, 카테고리별로 집계한다.
-10. UI는 다음 두 가지 방식으로 표시할 수 있어야 한다.
+9. `BL/BR`, `BT/BB` 루트에서는 `Type` 값으로 실제 face를 판별한다.
+10. 추출한 패치를 IMEI별, 면별, 카테고리별로 집계한다.
+11. UI는 다음 두 가지 방식으로 표시할 수 있어야 한다.
     - 전체 패치 수를 면별 patch grid에 표시
     - IMEI별 defect 발생 개수를 기준으로 표시
 
 ## 경로 구조 이해
 
-사용자가 지정하는 루트 경로는 면별로 다르다.
+사용자가 지정하는 루트 경로는 4개다.
+
+- `A`: A면 전용 루트
+- `BL/BR`: BL, BR이 함께 들어 있는 루트
+- `BT/BB`: BT, BB가 함께 들어 있는 루트
+- `C`: C면 전용 루트
 
 예상 구조:
 
@@ -86,8 +92,8 @@ yymmdd
 
 날짜 목록 병합 방식:
 
-- 6개 면 루트 경로에서 발견한 날짜 폴더의 합집합을 UI에 표시한다.
-- 선택한 날짜가 일부 면에 없으면, 해당 면은 누락 상태로 표시하고 스캔은 가능한 면만 진행한다.
+- 4개 루트 경로에서 발견한 날짜 폴더의 합집합을 UI에 표시한다.
+- 선택한 날짜가 일부 루트에 없으면, 해당 루트는 누락 상태로 표시하고 스캔은 가능한 루트만 진행한다.
 
 ## 검사 단위 폴더명 파싱
 
@@ -145,7 +151,7 @@ Filtered[0][9][C_Center][0].png
 - `category`: `Defects`, `Refined`, `Filtered`
 - `row`: `0`, `1` 등
 - `col`: `9`, `1` 등
-- `type`: `C_Center`, `B_Top` 등
+- `type`: `C_Center`, `BLeft_Bottom`, `BRight_Top`, `BTop_Right`, `BBottom_Left` 등
 - `vector`: `0` 등
 
 권장 정규식:
@@ -158,6 +164,17 @@ Filtered[0][9][C_Center][0].png
 
 - 확장자는 `.png`, `.PNG` 모두 허용한다.
 - category는 원본 문자열을 유지하되, 내부 비교용으로 소문자 정규화 값을 별도로 둔다.
+
+face 판별 규칙:
+
+- `A`, `C` 루트는 루트 슬롯 자체가 face 기준이다.
+- `BL/BR` 루트는 `Type` 값의 prefix로 face를 결정한다.
+  - `BLeft_*` 또는 `B_Left_*`: `BL`
+  - `BRight_*` 또는 `B_Right_*`: `BR`
+- `BT/BB` 루트는 `Type` 값의 prefix로 face를 결정한다.
+  - `BTop_*` 또는 `B_Top_*`: `BT`
+  - `BBottom_*` 또는 `B_Bottom_*`: `BB`
+- 루트 슬롯과 `Type` prefix가 맞지 않는 파일은 `patch type root mismatch`로 집계하고 표시 대상에서 제외한다.
 
 ## 데이터 모델
 
@@ -243,10 +260,8 @@ GRID_SHAPES = {
 상단 설정 영역:
 
 - `A` 경로 선택
-- `BL` 경로 선택
-- `BT` 경로 선택
-- `BB` 경로 선택
-- `BR` 경로 선택
+- `BL/BR` 경로 선택
+- `BT/BB` 경로 선택
 - `C` 경로 선택
 - `완료` 버튼
 
@@ -293,9 +308,9 @@ GRID_SHAPES = {
 
 ## 처리 알고리즘
 
-### 1. 면별 루트 경로 확정
+### 1. 루트 경로 확정
 
-사용자가 6개 경로를 지정하고 `완료`를 누르면:
+사용자가 4개 경로를 지정하고 `완료`를 누르면:
 
 1. 각 경로 존재 여부를 확인한다.
 2. 존재하지 않는 경로는 경고한다.
@@ -330,25 +345,26 @@ GRID_SHAPES = {
 
 다음 항목은 status 영역 또는 별도 summary에 표시한다.
 
-- 존재하지 않는 면별 루트 경로
+- 존재하지 않는 루트 경로
 - 날짜 폴더명 파싱 실패
 - 검사 단위 폴더명 파싱 실패
 - 이미지 파일명 파싱 실패
+- 루트 슬롯과 `Type` prefix 불일치
 - row/col이 해당 face grid 범위를 벗어난 이미지
 - 이미지 확장자가 `.png`가 아닌 파일
 - 선택 날짜가 특정 face에는 없는 경우
 
 ## 구현 순서
 
-1. 현재 `set_visualizer.py`의 UI를 경로 입력 6개와 날짜 선택 흐름으로 확장한다.
+1. 현재 `set_visualizer.py`의 UI를 경로 입력 4개와 날짜 선택 흐름으로 확장한다.
 2. 날짜 폴더 스캔 함수 작성
-   - `scan_date_folders(face_roots) -> list[DateFolder]`
+   - `scan_date_folders(root_paths) -> list[DateFolder]`
 3. 검사 단위 폴더명 파서 작성
    - `parse_inspection_folder_name(name) -> InspectionMeta | None`
 4. 이미지 파일명 파서 작성
    - `parse_patch_filename(name) -> PatchMeta | None`
 5. 선택 날짜 스캔 함수 작성
-   - `scan_patches(face_roots, selected_yymmdd) -> ScanResult`
+   - `scan_patches(root_paths, selected_yymmdd) -> ScanResult`
 6. patch 집계 함수 작성
    - 전체 패치 수
    - IMEI별 defect 수
@@ -366,11 +382,12 @@ GRID_SHAPES = {
 1. `Defects`, `Refined`, `Filtered`는 실제 하위 폴더명이다.
    - 구현은 `<inspection_folder>/<category>/[row][col][Type][Vector].png` 구조를 기본으로 한다.
    - 기존 예시처럼 category가 파일명 prefix로 붙은 구조는 보조 호환만 둔다.
-2. `A`, `BL`, `BT`, `BB`, `BR`, `C`의 각 루트 경로에는 동일한 날짜 폴더 구조가 있다.
+2. `A`, `BL/BR`, `BT/BB`, `C`의 각 루트 경로에는 동일한 날짜 폴더 구조가 있다.
 3. 이미지 파일의 `row`, `col`은 0-base로 처리한다.
    - 예시가 `[0][9]` 형태이고, grid 범위도 0-base 기준으로 검증한다.
-4. `Type` 값인 `C_Center`, `B_Top`은 표시 필터로 쓰지 않고 메타데이터로만 보관한다.
-   - UI에서 면을 구분하는 기준은 사용자가 지정한 루트 경로와 face 슬롯이다.
+4. `Type` 값은 표시 필터로 쓰지 않고 메타데이터로 보관한다.
+   - 단, `BL/BR`, `BT/BB` 공용 루트에서는 `Type` prefix가 실제 face를 결정하는 기준이다.
+   - `BLeft`는 `BL`, `BRight`는 `BR`, `BTop`은 `BT`, `BBottom`은 `BB`로 매핑한다.
 5. UI에서는 `Defects`, `Refined`, `Filtered` category를 선택할 수 있어야 한다.
    - 전체 패치 표시, IMEI별 count, 고유 IMEI 발생 수 모두 선택 category 기준으로 계산한다.
 6. 같은 IMEI, 같은 face, 같은 row/col에 여러 이미지가 있는 경우 category를 분리해서 메타데이터를 수집한다.
@@ -381,7 +398,7 @@ GRID_SHAPES = {
 
 1차 구현에서는 실제 이미지 미리보기 대신 patch count heatmap을 먼저 완성한다.
 
-- 6개 face별 루트 경로 입력
+- 4개 루트 경로 입력
 - 날짜 폴더 스캔
 - 선택 날짜 적용
 - 검사 폴더명 메타데이터 파싱

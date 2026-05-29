@@ -26,6 +26,12 @@ ROOT_SLOT_LABELS = {
 }
 FACE_DRAW_ORDER = ("BT", "BL", "A", "BB", "BR", "C")
 CATEGORIES = ("Defects", "Refined", "Filtered")
+CATEGORY_ALIASES = {
+    "defect": "Defects",
+    "defects": "Defects",
+    "refined": "Refined",
+    "filtered": "Filtered",
+}
 ALL_VALUE = "All"
 MODE_TOTAL_PATCHES = "Total patches"
 MODE_UNIQUE_IMEI = "Unique IMEI count"
@@ -72,7 +78,7 @@ PANEL_COLORS = {
     "BT": "#eff6ff",
     "BB": "#eff6ff",
 }
-CATEGORY_LOOKUP = {category.lower(): category for category in CATEGORIES}
+CATEGORY_LOOKUP = CATEGORY_ALIASES
 DATE_FOLDER_RE = re.compile(r"^\d{6}$")
 PATCH_RE = re.compile(
     r"^\[(?P<row>\d+)\]\[(?P<col>\d+)\]\[(?P<defect_type>[^\]]+)\]\[(?P<vector>[^\]]+)\]\.png$",
@@ -274,12 +280,19 @@ def parse_patch_filename(name: str, category: str | None = None) -> PatchMeta | 
 
 
 def to_display_cell(face: str, meta: PatchMeta) -> tuple[int, int] | None:
+    primary = xy_to_display_cell(face, meta.row, meta.col)
+    if primary is not None:
+        return primary
+    return xy_to_display_cell(face, meta.col, meta.row)
+
+
+def xy_to_display_cell(face: str, x: int, y: int) -> tuple[int, int] | None:
     max_file_x, max_file_y = FILE_COORD_LIMITS[face]
-    if not (0 <= meta.row <= max_file_x and 0 <= meta.col <= max_file_y):
+    if not (0 <= x <= max_file_x and 0 <= y <= max_file_y):
         return None
 
-    display_row = meta.col
-    display_col = meta.row
+    display_row = y
+    display_col = x
 
     row_count, col_count = GRID_SHAPES[face]
     if not (0 <= display_row < row_count and 0 <= display_col < col_count):
@@ -367,6 +380,10 @@ def build_original_patch_ref(
         vector=meta.vector,
         path=inspection_dir / "Patches" / patches_filename,
     )
+
+
+def normalize_category_name(value: str) -> str | None:
+    return CATEGORY_LOOKUP.get(value.strip().lower())
 
 
 def scan_date_folders(root_paths: dict[str, Path]) -> tuple[list[DateFolder], Counter[str]]:
@@ -460,12 +477,25 @@ def _scan_inspection_patches(
     patches: list[PatchImage] = []
     errors: Counter[str] = Counter()
 
+    try:
+        inspection_children = list(inspection_dir.iterdir())
+    except OSError:
+        errors["inspection read error"] += 1
+        return patches, errors
+
+    category_dirs: dict[str, Path] = {}
+    direct_files: list[Path] = []
+    for child in inspection_children:
+        if child.is_dir():
+            category = normalize_category_name(child.name)
+            if category is not None:
+                category_dirs[category] = child
+        elif child.is_file():
+            direct_files.append(child)
+
     for category in CATEGORIES:
-        category_dir = inspection_dir / category
-        if not category_dir.exists():
-            continue
-        if not category_dir.is_dir():
-            errors["category path is not folder"] += 1
+        category_dir = category_dirs.get(category)
+        if category_dir is None:
             continue
 
         try:
@@ -474,16 +504,17 @@ def _scan_inspection_patches(
             errors[f"{category}: read error"] += 1
             continue
 
+        if not category_files:
+            try:
+                category_files = [path for path in category_dir.rglob("*") if path.is_file()]
+            except OSError:
+                errors[f"{category}: recursive read error"] += 1
+                continue
+
         for path in category_files:
             patch = _build_patch_image(root_slot, day_folder, inspection, path, errors, category)
             if patch is not None:
                 patches.append(patch)
-
-    try:
-        direct_files = [path for path in inspection_dir.iterdir() if path.is_file()]
-    except OSError:
-        errors["inspection direct read error"] += 1
-        direct_files = []
 
     for path in direct_files:
         patch = _build_patch_image(root_slot, day_folder, inspection, path, errors, None)
@@ -1118,6 +1149,8 @@ def run_self_test() -> None:
     assert parse_date_folder_name("260528") == date(2026, 5, 28)
     assert parse_date_folder_name("260230") is None
     assert load_saved_roots(Path("__missing_set_visualizer_config__.json")) == {}
+    assert normalize_category_name("Defect") == "Defects"
+    assert normalize_category_name("filtered") == "Filtered"
     inspection = parse_inspection_folder_name("122850_ABC1234567890_SM-S948-SMART_COSMETIC_V26.03.10.0_ZW")
     assert inspection is not None
     assert inspection.hhmmss == "122850"
@@ -1178,6 +1211,9 @@ def run_self_test() -> None:
     )
     assert face_from_patch_type("BT/BB", extended_filtered.defect_type) == "BT"
     assert to_display_cell("BT", extended_filtered) == (1, 20)
+    swapped_a = parse_patch_filename("[30][19][C_Center][0].png", "Defects")
+    assert swapped_a is not None
+    assert to_display_cell("A", swapped_a) == (30, 19)
     assert face_from_patch_type("BL/BR", bt_patch.defect_type) is None
     assert to_display_cell("BL", PatchMeta("Defects", 2, 30, "B_Left", "0")) is None
 

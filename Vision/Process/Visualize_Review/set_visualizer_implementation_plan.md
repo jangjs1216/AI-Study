@@ -146,11 +146,29 @@ Refined[1][1][B_Top][0].png
 Filtered[0][9][C_Center][0].png
 ```
 
+`Refined`, `Filtered`에는 다음 확장 형태도 존재한다.
+
+```text
+[yymmdd][imei][x][y][FacePart][PositionPart][Vector].png
+```
+
+예:
+
+```text
+[260528][ABC1234567890][0][23][BRight][Center][0].png
+```
+
+이 형태는 `FacePart`와 `PositionPart`를 합쳐 기존 `Type`과 같은 값으로 정규화한다.
+
+```text
+BRight + Center -> BRight_Center
+```
+
 수집해야 하는 값:
 
 - `category`: `Defects`, `Refined`, `Filtered`
-- `row`: `0`, `1` 등
-- `col`: `9`, `1` 등
+- `x`: `0`, `1` 등
+- `y`: `9`, `1` 등
 - `type`: `C_Center`, `BLeft_Bottom`, `BRight_Top`, `BTop_Right`, `BBottom_Left` 등
 - `vector`: `0` 등
 
@@ -158,6 +176,12 @@ Filtered[0][9][C_Center][0].png
 
 ```text
 ^(?P<category>[^\[]+)\[(?P<row>\d+)\]\[(?P<col>\d+)\]\[(?P<type>[^\]]+)\]\[(?P<vector>[^\]]+)\]\.png$
+```
+
+확장 형태 정규식:
+
+```text
+^\[(?P<file_day>\d{6})\]\[(?P<file_imei>[^\]]+)\]\[(?P<x>\d+)\]\[(?P<y>\d+)\]\[(?P<face_part>[^\]]+)\]\[(?P<position_part>[^\]]+)\]\[(?P<vector>[^\]]+)\]\.png$
 ```
 
 대소문자 처리:
@@ -175,6 +199,19 @@ face 판별 규칙:
   - `BTop_*` 또는 `B_Top_*`: `BT`
   - `BBottom_*` 또는 `B_Bottom_*`: `BB`
 - 루트 슬롯과 `Type` prefix가 맞지 않는 파일은 `patch type root mismatch`로 집계하고 표시 대상에서 제외한다.
+
+원본 patch 참조:
+
+- `Defects`, `Refined`, `Filtered` patch를 수집할 때 같은 검사 폴더의 sibling인 `Patches` 폴더에 있는 원본 이미지 경로도 내부 메타데이터로 함께 보관한다.
+- `Patches` 폴더는 탐색하지 않는다.
+- 현재 patch 메타데이터로 아래 파일명을 O(1)로 구성한다.
+
+```text
+<inspection_folder>/Patches/[yymmdd][imei][x][y][FacePart][PositionPart][Vector].png
+```
+
+- 이 경로는 나중에 viewer에서 원본과 결과 이미지를 비교할 때 사용한다.
+- 파일 존재 여부 확인도 scan 단계에서는 수행하지 않는다.
 
 ## 데이터 모델
 
@@ -207,6 +244,15 @@ PatchImage:
     imei: str
     model_file: str
     color_code: str
+    category: str
+    row: int
+    col: int
+    defect_type: str
+    vector: str
+    path: Path
+    original_patch: PatchFileRef | None
+
+PatchFileRef:
     category: str
     row: int
     col: int

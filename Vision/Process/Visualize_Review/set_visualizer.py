@@ -82,6 +82,11 @@ PREFIX_PATCH_RE = re.compile(
     r"^(?P<category>[^\[]+)\[(?P<row>\d+)\]\[(?P<col>\d+)\]\[(?P<defect_type>[^\]]+)\]\[(?P<vector>[^\]]+)\]\.png$",
     re.IGNORECASE,
 )
+EXTENDED_PATCH_RE = re.compile(
+    r"^\[(?P<file_day>\d{6})\]\[(?P<file_imei>[^\]]+)\]\[(?P<row>\d+)\]\[(?P<col>\d+)\]"
+    r"\[(?P<face_part>[^\]]+)\]\[(?P<position_part>[^\]]+)\]\[(?P<vector>[^\]]+)\]\.png$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -126,6 +131,16 @@ class PatchMeta:
 
 
 @dataclass(frozen=True)
+class PatchFileRef:
+    category: str
+    row: int
+    col: int
+    defect_type: str
+    vector: str
+    path: Path
+
+
+@dataclass(frozen=True)
 class PatchImage:
     face: str
     day_folder: str
@@ -139,6 +154,7 @@ class PatchImage:
     defect_type: str
     vector: str
     path: Path
+    original_patch: PatchFileRef | None = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +236,22 @@ def parse_patch_filename(name: str, category: str | None = None) -> PatchMeta | 
     match = PATCH_RE.fullmatch(name)
     parsed_category = category
     if match is None:
+        extended_match = EXTENDED_PATCH_RE.fullmatch(name)
+        if extended_match is not None:
+            if parsed_category is None:
+                return None
+            canonical_category = CATEGORY_LOOKUP.get(parsed_category.lower())
+            if canonical_category is None:
+                return None
+            defect_type = f"{extended_match.group('face_part')}_{extended_match.group('position_part')}"
+            return PatchMeta(
+                category=canonical_category,
+                row=int(extended_match.group("row")),
+                col=int(extended_match.group("col")),
+                defect_type=defect_type,
+                vector=extended_match.group("vector"),
+            )
+
         match = PREFIX_PATCH_RE.fullmatch(name)
         if match is None:
             return None
@@ -275,6 +307,66 @@ def face_from_patch_type(root_slot: str, defect_type: str) -> str | None:
         if type_key.startswith("bbottom"):
             return "BB"
     return None
+
+
+def canonical_patch_face_part(face: str) -> str:
+    return {
+        "A": "A",
+        "C": "C",
+        "BL": "BLeft",
+        "BR": "BRight",
+        "BT": "BTop",
+        "BB": "BBottom",
+    }[face]
+
+
+def split_patch_type_for_patches(face: str, defect_type: str) -> tuple[str, str]:
+    face_part = canonical_patch_face_part(face)
+    parts = [part for part in defect_type.split("_") if part]
+    face_key = normalize_type_key(face_part)
+
+    if parts:
+        first_key = normalize_type_key(parts[0])
+        if first_key == face_key:
+            return face_part, "_".join(parts[1:]) or "Center"
+
+    if len(parts) >= 2:
+        first_two_key = normalize_type_key(parts[0] + parts[1])
+        if first_two_key == face_key:
+            return face_part, "_".join(parts[2:]) or "Center"
+
+    type_key = normalize_type_key(defect_type)
+    if type_key.startswith(face_key):
+        suffix = type_key[len(face_key) :]
+        return face_part, suffix[:1].upper() + suffix[1:] if suffix else "Center"
+
+    if len(parts) >= 2:
+        return face_part, "_".join(parts[1:])
+    return face_part, "Center"
+
+
+def build_patches_filename(day_folder: str, imei: str, face: str, meta: PatchMeta) -> str:
+    face_part, position_part = split_patch_type_for_patches(face, meta.defect_type)
+    return f"[{day_folder}][{imei}][{meta.row}][{meta.col}][{face_part}][{position_part}][{meta.vector}].png"
+
+
+def build_original_patch_ref(
+    inspection_dir: Path,
+    day_folder: str,
+    inspection: InspectionMeta,
+    face: str,
+    meta: PatchMeta,
+) -> PatchFileRef:
+    patches_filename = build_patches_filename(day_folder, inspection.imei, face, meta)
+    face_part, position_part = split_patch_type_for_patches(face, meta.defect_type)
+    return PatchFileRef(
+        category="Patches",
+        row=meta.row,
+        col=meta.col,
+        defect_type=f"{face_part}_{position_part}",
+        vector=meta.vector,
+        path=inspection_dir / "Patches" / patches_filename,
+    )
 
 
 def scan_date_folders(root_paths: dict[str, Path]) -> tuple[list[DateFolder], Counter[str]]:
@@ -428,6 +520,7 @@ def _build_patch_image(
         errors["patch out of grid"] += 1
         return None
     display_row, display_col = display_cell
+    original_patch = build_original_patch_ref(inspection_dir, day_folder, inspection, face, meta)
 
     return PatchImage(
         face=face,
@@ -442,6 +535,7 @@ def _build_patch_image(
         defect_type=meta.defect_type,
         vector=meta.vector,
         path=path,
+        original_patch=original_patch,
     )
 
 
@@ -1051,6 +1145,39 @@ def run_self_test() -> None:
     bb_patch = parse_patch_filename("[12][0][BBottom_Left][0].png", "Filtered")
     assert bb_patch is not None
     assert face_from_patch_type("BT/BB", bb_patch.defect_type) == "BB"
+    extended_refined = parse_patch_filename("[260528][ABC1234567890][0][23][BRight][Center][0].png", "Refined")
+    assert extended_refined == PatchMeta(
+        category="Refined",
+        row=0,
+        col=23,
+        defect_type="BRight_Center",
+        vector="0",
+    )
+    assert face_from_patch_type("BL/BR", extended_refined.defect_type) == "BR"
+    assert to_display_cell("BR", extended_refined) == (23, 0)
+    assert (
+        build_patches_filename("260528", "ABC1234567890", "BR", extended_refined)
+        == "[260528][ABC1234567890][0][23][BRight][Center][0].png"
+    )
+    original_ref = build_original_patch_ref(Path("inspection"), "260528", inspection, "BR", extended_refined)
+    assert original_ref == PatchFileRef(
+        category="Patches",
+        row=0,
+        col=23,
+        defect_type="BRight_Center",
+        vector="0",
+        path=Path("inspection") / "Patches" / "[260528][ABC1234567890][0][23][BRight][Center][0].png",
+    )
+    extended_filtered = parse_patch_filename("[260528][ABC1234567890][20][1][BTop][Center][1].png", "Filtered")
+    assert extended_filtered == PatchMeta(
+        category="Filtered",
+        row=20,
+        col=1,
+        defect_type="BTop_Center",
+        vector="1",
+    )
+    assert face_from_patch_type("BT/BB", extended_filtered.defect_type) == "BT"
+    assert to_display_cell("BT", extended_filtered) == (1, 20)
     assert face_from_patch_type("BL/BR", bt_patch.defect_type) is None
     assert to_display_cell("BL", PatchMeta("Defects", 2, 30, "B_Left", "0")) is None
 

@@ -539,12 +539,12 @@ def _scan_inspection_patches(
             category_files = safe_rglob_files(category_dir, errors, f"{category}: recursive read error")
 
         for path in category_files:
-            patch = _build_patch_image(root_slot, day_folder, inspection, path, errors, category)
+            patch = _build_patch_image(root_slot, day_folder, inspection_dir, inspection, path, errors, category)
             if patch is not None:
                 patches.append(patch)
 
     for path in direct_files:
-        patch = _build_patch_image(root_slot, day_folder, inspection, path, errors, None)
+        patch = _build_patch_image(root_slot, day_folder, inspection_dir, inspection, path, errors, None)
         if patch is not None:
             patches.append(patch)
 
@@ -554,6 +554,7 @@ def _scan_inspection_patches(
 def _build_patch_image(
     root_slot: str,
     day_folder: str,
+    inspection_dir: Path,
     inspection: InspectionMeta,
     path: Path,
     errors: Counter[str],
@@ -1228,6 +1229,20 @@ def run_self_test() -> None:
         vector="0",
         path=Path("inspection") / "Patches" / "[260528][ABC1234567890][0][23][BRight][Center][0].png",
     )
+    errors: Counter[str] = Counter()
+    built_patch = _build_patch_image(
+        "BL/BR",
+        "260528",
+        Path("inspection"),
+        inspection,
+        Path("[260528][ABC1234567890][0][23][BRight][Center][0].png"),
+        errors,
+        "Refined",
+    )
+    assert built_patch is not None
+    assert built_patch.face == "BR"
+    assert built_patch.original_patch == original_ref
+    assert not errors
     extended_filtered = parse_patch_filename("[260528][ABC1234567890][20][1][BTop][Center][1].png", "Filtered")
     assert extended_filtered == PatchMeta(
         category="Filtered",

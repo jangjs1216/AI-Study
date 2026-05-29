@@ -388,6 +388,46 @@ def build_original_patch_ref(
     )
 
 
+def unique_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    result: list[Path] = []
+    for path in paths:
+        key = os.path.normcase(str(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def split_patch_type_preserving_prefix(defect_type: str) -> tuple[str, str] | None:
+    parts = [part for part in defect_type.split("_") if part]
+    if len(parts) < 2:
+        return None
+    return parts[0], "_".join(parts[1:]) or "Center"
+
+
+def original_patch_path_candidates(patch: PatchImage) -> list[Path]:
+    if patch.original_patch is None:
+        return []
+
+    patches_dir = patch.original_patch.path.parent
+    paths = [patch.original_patch.path]
+    ref = patch.original_patch
+
+    preserved = split_patch_type_preserving_prefix(patch.defect_type)
+    if preserved is not None:
+        face_part, position_part = preserved
+        paths.append(
+            patches_dir
+            / f"[{patch.day_folder}][{patch.imei}][{ref.row}][{ref.col}][{face_part}][{position_part}][{ref.vector}].png"
+        )
+
+    paths.append(patches_dir / f"[{ref.row}][{ref.col}][{patch.defect_type}][{ref.vector}].png")
+    paths.append(patches_dir / f"Patches[{ref.row}][{ref.col}][{patch.defect_type}][{ref.vector}].png")
+    return unique_paths(paths)
+
+
 def normalize_category_name(value: str) -> str | None:
     return CATEGORY_LOOKUP.get(value.strip().lower())
 
@@ -931,8 +971,13 @@ class PatchViewerWindow(tk.Toplevel):
             f"color={patch.color_code} | {patch.face}[{patch.row}][{patch.col}] | {patch.category}"
         )
         self.patch_path_var.set(str(patch.path))
-        original_path = patch.original_patch.path if patch.original_patch is not None else None
-        self.original_path_var.set(str(original_path) if original_path is not None else "No original patch metadata")
+        original_path = self.resolve_original_patch_path(patch)
+        if original_path is not None:
+            self.original_path_var.set(str(original_path))
+        elif patch.original_patch is not None:
+            self.original_path_var.set(f"Expected: {patch.original_patch.path}")
+        else:
+            self.original_path_var.set("No original patch metadata")
 
         self.image_refs.clear()
         self._set_image(self.patch_image_label, patch.path, "Patch image not available")
@@ -953,6 +998,15 @@ class PatchViewerWindow(tk.Toplevel):
             return
         self.image_refs.append(image)
         label.configure(image=image, text="")
+
+    def resolve_original_patch_path(self, patch: PatchImage) -> Path | None:
+        for path in original_patch_path_candidates(patch):
+            try:
+                if path.is_file():
+                    return path
+            except OSError:
+                continue
+        return None
 
     def _load_photo_image(
         self,
@@ -1015,7 +1069,7 @@ class SetVisualizerApp(tk.Tk):
         self.panel_scan_keys: dict[str, tuple[str, tuple[tuple[str, str], ...]] | None] = {
             key: None for key in PANEL_KEYS
         }
-        self.patch_viewer: PatchViewerWindow | None = None
+        self.patch_viewers: dict[str, PatchViewerWindow | None] = {key: None for key in PANEL_KEYS}
 
         self._build_ui()
         self._set_date_controls_enabled(False)
@@ -1375,10 +1429,12 @@ class SetVisualizerApp(tk.Tk):
         ]
         if not patches:
             return
-        if self.patch_viewer is None or not self.patch_viewer.winfo_exists():
-            self.patch_viewer = PatchViewerWindow(self)
+        viewer = self.patch_viewers.get(key)
+        if viewer is None or not viewer.winfo_exists():
+            viewer = PatchViewerWindow(self)
+            self.patch_viewers[key] = viewer
         selected = self.date_options.get(self.date_vars[key].get(), "-")
-        self.patch_viewer.show_patches(f"{PANEL_TITLES[key]} {selected} {face}[{row}][{col}]", patches)
+        viewer.show_patches(f"{PANEL_TITLES[key]} {selected} {face}[{row}][{col}]", patches)
 
     def current_filtered_patches(self, key: str) -> list[PatchImage]:
         category = self.category_var.get() or ALL_VALUE
@@ -1480,6 +1536,34 @@ def run_self_test() -> None:
     assert built_patch.face == "BR"
     assert built_patch.original_patch == original_ref
     assert not errors
+    original_candidates = original_patch_path_candidates(built_patch)
+    assert Path("inspection") / "Patches" / "[260528][ABC1234567890][0][23][BRight][Center][0].png" in original_candidates
+
+    a_like_patch = PatchImage(
+        "A",
+        "260528",
+        "122850",
+        "ABC1234567890",
+        "MODEL_A",
+        "ZW",
+        "Defects",
+        9,
+        0,
+        "C_Center",
+        "0",
+        Path("inspection") / "Defects" / "[0][9][C_Center][0].png",
+        build_original_patch_ref(
+            Path("inspection"),
+            "260528",
+            inspection,
+            "A",
+            PatchMeta("Defects", 0, 9, "C_Center", "0"),
+        ),
+    )
+    a_candidates = original_patch_path_candidates(a_like_patch)
+    assert Path("inspection") / "Patches" / "[260528][ABC1234567890][0][9][A][Center][0].png" in a_candidates
+    assert Path("inspection") / "Patches" / "[260528][ABC1234567890][0][9][C][Center][0].png" in a_candidates
+    assert Path("inspection") / "Patches" / "[0][9][C_Center][0].png" in a_candidates
     extended_filtered = parse_patch_filename("[260528][ABC1234567890][20][1][BTop][Center][1].png", "Filtered")
     assert extended_filtered == PatchMeta(
         category="Filtered",

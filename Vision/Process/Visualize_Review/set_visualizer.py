@@ -39,6 +39,7 @@ CATEGORY_ALIASES = {
     "filtered": "Filtered",
 }
 ALL_VALUE = "All"
+TIME_ALL_VALUE = "All"
 MODE_TOTAL_PATCHES = "Total patches"
 MODE_UNIQUE_IMEI = "Unique IMEI count"
 PANEL_KEYS = ("left", "right")
@@ -173,6 +174,8 @@ class PatchImage:
 class ScanResult:
     patches: list[PatchImage]
     inspections: int
+    imeis: tuple[str, ...]
+    inspection_records: tuple[InspectionMeta, ...]
     errors: Counter[str]
     missing_faces: tuple[str, ...]
 
@@ -497,6 +500,8 @@ def scan_patches(root_paths: dict[str, Path], selected_yymmdd: str) -> ScanResul
     patches: list[PatchImage] = []
     errors: Counter[str] = Counter()
     missing_roots: list[str] = []
+    imeis: set[str] = set()
+    inspection_records: set[InspectionMeta] = set()
     inspections = 0
     futures = []
 
@@ -518,6 +523,8 @@ def scan_patches(root_paths: dict[str, Path], selected_yymmdd: str) -> ScanResul
                 if inspection is None:
                     errors["invalid inspection folder"] += 1
                     continue
+                imeis.add(inspection.imei)
+                inspection_records.add(inspection)
                 inspections += 1
                 futures.append(
                     executor.submit(
@@ -544,6 +551,13 @@ def scan_patches(root_paths: dict[str, Path], selected_yymmdd: str) -> ScanResul
     return ScanResult(
         patches=patches,
         inspections=inspections,
+        imeis=tuple(sorted(imeis)),
+        inspection_records=tuple(
+            sorted(
+                inspection_records,
+                key=lambda item: (item.hhmmss, item.imei, item.model_file, item.color_code),
+            )
+        ),
         errors=errors,
         missing_faces=tuple(missing_roots),
     )
@@ -657,6 +671,58 @@ def filter_patches(patches: list[PatchImage], category: str, imei: str) -> list[
     return result
 
 
+def format_time_option(hhmmss: str) -> str:
+    if not re.fullmatch(r"\d{6}", hhmmss):
+        return hhmmss
+    return f"{hhmmss[:2]}:{hhmmss[2:4]}:{hhmmss[4:]}"
+
+
+def parse_time_option(value: str) -> str | None:
+    text = value.strip()
+    if not text or text == TIME_ALL_VALUE:
+        return None
+    digits = re.sub(r"\D", "", text)
+    if re.fullmatch(r"\d{6}", digits):
+        return digits
+    return None
+
+
+def normalize_time_range(start: str | None, end: str | None) -> tuple[str | None, str | None]:
+    if start is not None and end is not None and start > end:
+        return end, start
+    return start, end
+
+
+def is_time_in_range(hhmmss: str, start: str | None, end: str | None) -> bool:
+    if start is not None and hhmmss < start:
+        return False
+    if end is not None and hhmmss > end:
+        return False
+    return True
+
+
+def filter_patches_by_time(
+    patches: list[PatchImage],
+    start: str | None,
+    end: str | None,
+) -> list[PatchImage]:
+    start, end = normalize_time_range(start, end)
+    if start is None and end is None:
+        return patches
+    return [patch for patch in patches if is_time_in_range(patch.hhmmss, start, end)]
+
+
+def filter_inspection_records_by_time(
+    records: tuple[InspectionMeta, ...],
+    start: str | None,
+    end: str | None,
+) -> tuple[InspectionMeta, ...]:
+    start, end = normalize_time_range(start, end)
+    if start is None and end is None:
+        return records
+    return tuple(record for record in records if is_time_in_range(record.hhmmss, start, end))
+
+
 def aggregate_total_patches(patches: list[PatchImage]) -> dict[str, list[list[int]]]:
     counts = make_empty_counts()
     for patch in patches:
@@ -689,6 +755,44 @@ def summarize_imeis(patches: list[PatchImage]) -> list[tuple[str, int, int, int,
         rows.append((imei, defects + refined + filtered, defects, refined, filtered))
     rows.sort(key=lambda item: (-item[1], item[0]))
     return rows
+
+
+def summarize_face_presence(
+    patches: list[PatchImage],
+    denominator_imeis: set[str],
+) -> list[tuple[str, int, int, float, int, float, int, float]]:
+    total = len(denominator_imeis)
+    by_face_category: dict[str, dict[str, set[str]]] = {
+        face: {category: set() for category in CATEGORIES} for face in FACES
+    }
+
+    for patch in patches:
+        if patch.imei not in denominator_imeis:
+            continue
+        by_face_category[patch.face][patch.category].add(patch.imei)
+
+    rows: list[tuple[str, int, int, float, int, float, int, float]] = []
+    for face in FACES:
+        defects = len(by_face_category[face]["Defects"])
+        refined = len(by_face_category[face]["Refined"])
+        filtered = len(by_face_category[face]["Filtered"])
+        rows.append(
+            (
+                face,
+                total,
+                defects,
+                defects / total if total else 0.0,
+                refined,
+                refined / total if total else 0.0,
+                filtered,
+                filtered / total if total else 0.0,
+            )
+        )
+    return rows
+
+
+def format_presence_rate(count: int, total: int, rate: float) -> str:
+    return f"{count}/{total} ({rate * 100:.1f}%)"
 
 
 def patch_sort_key(patch: PatchImage) -> tuple[str, str, str, str, int, int, str, str, str]:
@@ -1050,6 +1154,8 @@ class SetVisualizerApp(tk.Tk):
 
         self.root_vars = {root_slot: tk.StringVar() for root_slot in ROOT_SLOTS}
         self.date_vars = {key: tk.StringVar() for key in PANEL_KEYS}
+        self.time_start_vars = {key: tk.StringVar(value=TIME_ALL_VALUE) for key in PANEL_KEYS}
+        self.time_end_vars = {key: tk.StringVar(value=TIME_ALL_VALUE) for key in PANEL_KEYS}
         self.category_var = tk.StringVar(value=ALL_VALUE)
         self.mode_var = tk.StringVar(value=MODE_TOTAL_PATCHES)
         self.imei_var = tk.StringVar(value=ALL_VALUE)
@@ -1057,13 +1163,18 @@ class SetVisualizerApp(tk.Tk):
         self.detail_vars = {key: tk.StringVar(value="No date loaded") for key in PANEL_KEYS}
         self.date_options: dict[str, str] = {}
         self.panel_patches: dict[str, list[PatchImage]] = {key: [] for key in PANEL_KEYS}
+        self.panel_imeis: dict[str, set[str]] = {key: set() for key in PANEL_KEYS}
+        self.panel_inspection_records: dict[str, tuple[InspectionMeta, ...]] = {key: () for key in PANEL_KEYS}
         self.panel_errors: dict[str, Counter[str]] = {key: Counter() for key in PANEL_KEYS}
         self.panel_missing_faces: dict[str, tuple[str, ...]] = {key: () for key in PANEL_KEYS}
         self.panel_inspections: dict[str, int] = {key: 0 for key in PANEL_KEYS}
         self.date_combos: dict[str, ttk.Combobox] = {}
+        self.time_start_combos: dict[str, ttk.Combobox] = {}
+        self.time_end_combos: dict[str, ttk.Combobox] = {}
         self.apply_buttons: dict[str, ttk.Button] = {}
         self.canvases: dict[str, PhoneSetCanvas] = {}
         self.summary_trees: dict[str, ttk.Treeview] = {}
+        self.face_rate_trees: dict[str, ttk.Treeview] = {}
         self.scan_cache: dict[tuple[str, tuple[tuple[str, str], ...]], ScanResult] = {}
         self.pending_scan_panels: dict[tuple[str, tuple[tuple[str, str], ...]], set[str]] = {}
         self.panel_scan_keys: dict[str, tuple[str, tuple[tuple[str, str], ...]] | None] = {
@@ -1168,6 +1279,29 @@ class SetVisualizerApp(tk.Tk):
         self.date_combos[key] = date_combo
         self.apply_buttons[key] = apply_button
 
+        ttk.Label(header, text="Time").pack(side="left", padx=(12, 4))
+        start_combo = ttk.Combobox(
+            header,
+            textvariable=self.time_start_vars[key],
+            width=9,
+            state="disabled",
+            values=(TIME_ALL_VALUE,),
+        )
+        end_combo = ttk.Combobox(
+            header,
+            textvariable=self.time_end_vars[key],
+            width=9,
+            state="disabled",
+            values=(TIME_ALL_VALUE,),
+        )
+        start_combo.pack(side="left")
+        ttk.Label(header, text="~").pack(side="left", padx=3)
+        end_combo.pack(side="left")
+        start_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_visuals())
+        end_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_visuals())
+        self.time_start_combos[key] = start_combo
+        self.time_end_combos[key] = end_combo
+
         canvas = PhoneSetCanvas(
             panel,
             cell_click_callback=lambda face, row, col, panel_key=key: self.on_cell_click(panel_key, face, row, col),
@@ -1194,6 +1328,24 @@ class SetVisualizerApp(tk.Tk):
         tree.pack(fill="x", pady=(3, 4))
         tree.bind("<<TreeviewSelect>>", lambda _event, panel_key=key: self.on_summary_select(panel_key))
         self.summary_trees[key] = tree
+
+        rate_frame = ttk.Frame(panel)
+        rate_frame.pack(fill="x", pady=(2, 0))
+        ttk.Label(rate_frame, text="Face Presence Rate", font=("", 9, "bold")).pack(anchor="w")
+        rate_columns = ("face", "defects", "refined", "filtered")
+        rate_tree = ttk.Treeview(rate_frame, columns=rate_columns, show="headings", height=len(FACES))
+        rate_headings = {
+            "face": "Face",
+            "defects": "Defects",
+            "refined": "Refined",
+            "filtered": "Filtered",
+        }
+        rate_widths = {"face": 58, "defects": 120, "refined": 120, "filtered": 120}
+        for column in rate_columns:
+            rate_tree.heading(column, text=rate_headings[column])
+            rate_tree.column(column, width=rate_widths[column], anchor="center")
+        rate_tree.pack(fill="x", pady=(3, 4))
+        self.face_rate_trees[key] = rate_tree
 
         ttk.Label(panel, textvariable=self.detail_vars[key], justify="left", anchor="nw").pack(fill="x")
         return panel
@@ -1313,7 +1465,14 @@ class SetVisualizerApp(tk.Tk):
             result = scan_patches(roots, selected)
             error: Exception | None = None
         except Exception as exc:
-            result = ScanResult(patches=[], inspections=0, errors=Counter({"scan failed": 1}), missing_faces=())
+            result = ScanResult(
+                patches=[],
+                inspections=0,
+                imeis=(),
+                inspection_records=(),
+                errors=Counter({"scan failed": 1}),
+                missing_faces=(),
+            )
             error = exc
         try:
             self.after(0, lambda: self.finish_panel_scan(cache_key, result, error))
@@ -1347,9 +1506,12 @@ class SetVisualizerApp(tk.Tk):
     def apply_scan_result(self, panels: tuple[str, ...], result: ScanResult) -> None:
         for panel in panels:
             self.panel_patches[panel] = result.patches
+            self.panel_imeis[panel] = set(result.imeis)
+            self.panel_inspection_records[panel] = result.inspection_records
             self.panel_errors[panel] = result.errors
             self.panel_missing_faces[panel] = result.missing_faces
             self.panel_inspections[panel] = result.inspections
+            self.populate_time_choices(panel)
         if panels:
             self.populate_imei_choices()
             self._set_filter_controls_enabled(True)
@@ -1357,7 +1519,13 @@ class SetVisualizerApp(tk.Tk):
 
     def populate_imei_choices(self) -> None:
         current = self.imei_var.get()
-        imeis = sorted({patch.imei for patches in self.panel_patches.values() for patch in patches})
+        imeis = sorted(
+            {
+                imei
+                for panel_imeis in self.panel_imeis.values()
+                for imei in panel_imeis
+            }
+        )
         values = (ALL_VALUE, *imeis)
         self.imei_combo.configure(values=values)
         if current in values:
@@ -1365,19 +1533,36 @@ class SetVisualizerApp(tk.Tk):
         else:
             self.imei_var.set(ALL_VALUE)
 
+    def populate_time_choices(self, key: str) -> None:
+        records = self.panel_inspection_records[key]
+        values = (TIME_ALL_VALUE, *tuple(format_time_option(record.hhmmss) for record in records))
+        values = tuple(dict.fromkeys(values))
+
+        self.time_start_combos[key].configure(values=values)
+        self.time_end_combos[key].configure(values=values)
+        if self.time_start_vars[key].get() not in values:
+            self.time_start_vars[key].set(TIME_ALL_VALUE)
+        if self.time_end_vars[key].get() not in values:
+            self.time_end_vars[key].set(TIME_ALL_VALUE)
+
+        state = "readonly" if len(values) > 1 else "disabled"
+        self.time_start_combos[key].configure(state=state)
+        self.time_end_combos[key].configure(state=state)
+
     def refresh_visuals(self) -> None:
         category = self.category_var.get() or ALL_VALUE
         imei = self.imei_var.get() or ALL_VALUE
 
         panel_parts: list[str] = []
         for key in PANEL_KEYS:
-            patches = filter_patches(self.panel_patches[key], category, imei)
+            patches = self.current_filtered_patches(key)
             if self.mode_var.get() == MODE_UNIQUE_IMEI:
                 counts = aggregate_unique_imeis(patches)
             else:
                 counts = aggregate_total_patches(patches)
             self.canvases[key].set_counts(counts)
             self.populate_summary(key)
+            self.populate_face_rate(key)
             panel_parts.append(self.update_panel_status(key, patches, counts))
 
         self.status_var.set(
@@ -1388,19 +1573,43 @@ class SetVisualizerApp(tk.Tk):
         tree = self.summary_trees[key]
         for item in tree.get_children():
             tree.delete(item)
-        for imei, total, defects, refined, filtered in summarize_imeis(self.panel_patches[key]):
+        for imei, total, defects, refined, filtered in summarize_imeis(self.current_time_filtered_patches(key)):
             tree.insert("", "end", values=(imei, total, defects, refined, filtered))
+
+    def populate_face_rate(self, key: str) -> None:
+        tree = self.face_rate_trees[key]
+        for item in tree.get_children():
+            tree.delete(item)
+
+        denominator_imeis = self.current_rate_denominator_imeis(key)
+        patches = self.current_imei_filtered_patches(key)
+        for face, total, defects, defect_rate, refined, refined_rate, filtered, filtered_rate in summarize_face_presence(
+            patches,
+            denominator_imeis,
+        ):
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    face,
+                    format_presence_rate(defects, total, defect_rate),
+                    format_presence_rate(refined, total, refined_rate),
+                    format_presence_rate(filtered, total, filtered_rate),
+                ),
+            )
 
     def update_panel_status(self, key: str, patches: list[PatchImage], counts: dict[str, list[list[int]]]) -> str:
         face_totals = ", ".join(f"{face}={sum(sum(row) for row in counts[face])}" for face in FACES)
-        imei_count = len({patch.imei for patch in self.panel_patches[key]})
+        shown_imei_count = len(self.current_rate_denominator_imeis(key))
+        total_imei_count = len(self.panel_imeis[key])
         selected = self.date_options.get(self.date_vars[key].get(), "")
         details = [
             f"date={selected or '-'}",
+            f"time={self.format_selected_time_range(key)}",
             f"inspections={self.panel_inspections[key]:,}",
             f"scanned patches={len(self.panel_patches[key]):,}",
             f"shown patches={len(patches):,}",
-            f"imeis={imei_count:,}",
+            f"imeis={shown_imei_count:,}/{total_imei_count:,}",
             f"max cell={max_count(counts):,}",
         ]
         if self.panel_missing_faces[key]:
@@ -1439,7 +1648,45 @@ class SetVisualizerApp(tk.Tk):
     def current_filtered_patches(self, key: str) -> list[PatchImage]:
         category = self.category_var.get() or ALL_VALUE
         imei = self.imei_var.get() or ALL_VALUE
-        return filter_patches(self.panel_patches[key], category, imei)
+        return filter_patches(self.current_time_filtered_patches(key), category, imei)
+
+    def current_time_range(self, key: str) -> tuple[str | None, str | None]:
+        return normalize_time_range(
+            parse_time_option(self.time_start_vars[key].get()),
+            parse_time_option(self.time_end_vars[key].get()),
+        )
+
+    def current_time_filtered_patches(self, key: str) -> list[PatchImage]:
+        start, end = self.current_time_range(key)
+        return filter_patches_by_time(self.panel_patches[key], start, end)
+
+    def current_time_filtered_inspection_records(self, key: str) -> tuple[InspectionMeta, ...]:
+        start, end = self.current_time_range(key)
+        return filter_inspection_records_by_time(self.panel_inspection_records[key], start, end)
+
+    def current_imei_filtered_patches(self, key: str) -> list[PatchImage]:
+        imei = self.imei_var.get() or ALL_VALUE
+        patches = self.current_time_filtered_patches(key)
+        if imei == ALL_VALUE:
+            return patches
+        return [patch for patch in patches if patch.imei == imei]
+
+    def current_rate_denominator_imeis(self, key: str) -> set[str]:
+        imei = self.imei_var.get() or ALL_VALUE
+        time_filtered_imeis = {record.imei for record in self.current_time_filtered_inspection_records(key)}
+        if not time_filtered_imeis:
+            time_filtered_imeis = {patch.imei for patch in self.current_time_filtered_patches(key)}
+        if imei != ALL_VALUE:
+            return {imei} if imei in time_filtered_imeis else set()
+        return time_filtered_imeis
+
+    def format_selected_time_range(self, key: str) -> str:
+        start, end = self.current_time_range(key)
+        if start is None and end is None:
+            return TIME_ALL_VALUE
+        start_text = format_time_option(start) if start is not None else "Start"
+        end_text = format_time_option(end) if end is not None else "End"
+        return f"{start_text}~{end_text}"
 
     def _set_date_controls_enabled(self, enabled: bool) -> None:
         combo_state = "readonly" if enabled else "disabled"
@@ -1579,6 +1826,10 @@ def run_self_test() -> None:
     assert to_display_cell("A", swapped_a) == (30, 19)
     assert face_from_patch_type("BL/BR", bt_patch.defect_type) is None
     assert to_display_cell("BL", PatchMeta("Defects", 2, 30, "B_Left", "0")) is None
+    assert format_time_option("122850") == "12:28:50"
+    assert parse_time_option("12:28:50") == "122850"
+    assert parse_time_option(TIME_ALL_VALUE) is None
+    assert normalize_time_range("130000", "120000") == ("120000", "130000")
 
     sample_patches = [
         PatchImage("A", "260528", "122850", "IMEI1", "MODEL_A", "ZW", "Defects", 0, 9, "C_Center", "0", Path("a")),
@@ -1594,6 +1845,24 @@ def run_self_test() -> None:
     assert unique_counts["A"][0][9] == 1
     summary = summarize_imeis(sample_patches)
     assert summary[0][0] == "IMEI1"
+    face_presence = summarize_face_presence(sample_patches, {"IMEI1", "IMEI2", "IMEI3", "IMEI4"})
+    by_face = {row[0]: row for row in face_presence}
+    assert by_face["A"][1] == 4
+    assert by_face["A"][2:8] == (1, 0.25, 1, 0.25, 0, 0.0)
+    assert by_face["C"][2:8] == (1, 0.25, 0, 0.0, 0, 0.0)
+    assert by_face["BT"][2:8] == (0, 0.0, 1, 0.25, 0, 0.0)
+    assert format_presence_rate(1, 4, 0.25) == "1/4 (25.0%)"
+    time_filtered = filter_patches_by_time(sample_patches, "122851", "122852")
+    assert [patch.imei for patch in time_filtered] == ["IMEI2", "IMEI3"]
+    reversed_time_filtered = filter_patches_by_time(sample_patches, "122852", "122851")
+    assert [patch.imei for patch in reversed_time_filtered] == ["IMEI2", "IMEI3"]
+    inspection_records = (
+        InspectionMeta("122850", "IMEI1", "MODEL_A", "ZW"),
+        InspectionMeta("122851", "IMEI2", "MODEL_A", "ZW"),
+        InspectionMeta("122852", "IMEI3", "MODEL_A", "ZW"),
+    )
+    filtered_records = filter_inspection_records_by_time(inspection_records, "122851", None)
+    assert [record.imei for record in filtered_records] == ["IMEI2", "IMEI3"]
 
     print("self-test passed")
 

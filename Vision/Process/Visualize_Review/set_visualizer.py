@@ -762,6 +762,7 @@ def summarize_face_presence(
     denominator_imeis: set[str],
 ) -> list[tuple[str, int, int, float, int, float, int, float]]:
     total = len(denominator_imeis)
+    by_category: dict[str, set[str]] = {category: set() for category in CATEGORIES}
     by_face_category: dict[str, dict[str, set[str]]] = {
         face: {category: set() for category in CATEGORIES} for face in FACES
     }
@@ -769,9 +770,25 @@ def summarize_face_presence(
     for patch in patches:
         if patch.imei not in denominator_imeis:
             continue
+        by_category[patch.category].add(patch.imei)
         by_face_category[patch.face][patch.category].add(patch.imei)
 
     rows: list[tuple[str, int, int, float, int, float, int, float]] = []
+    total_defects = len(by_category["Defects"])
+    total_refined = len(by_category["Refined"])
+    total_filtered = len(by_category["Filtered"])
+    rows.append(
+        (
+            "Total",
+            total,
+            total_defects,
+            total_defects / total if total else 0.0,
+            total_refined,
+            total_refined / total if total else 0.0,
+            total_filtered,
+            total_filtered / total if total else 0.0,
+        )
+    )
     for face in FACES:
         defects = len(by_face_category[face]["Defects"])
         refined = len(by_face_category[face]["Refined"])
@@ -1333,7 +1350,7 @@ class SetVisualizerApp(tk.Tk):
         rate_frame.pack(fill="x", pady=(2, 0))
         ttk.Label(rate_frame, text="Face Presence Rate", font=("", 9, "bold")).pack(anchor="w")
         rate_columns = ("face", "defects", "refined", "filtered")
-        rate_tree = ttk.Treeview(rate_frame, columns=rate_columns, show="headings", height=len(FACES))
+        rate_tree = ttk.Treeview(rate_frame, columns=rate_columns, show="headings", height=len(FACES) + 1)
         rate_headings = {
             "face": "Face",
             "defects": "Defects",
@@ -1847,6 +1864,9 @@ def run_self_test() -> None:
     assert summary[0][0] == "IMEI1"
     face_presence = summarize_face_presence(sample_patches, {"IMEI1", "IMEI2", "IMEI3", "IMEI4"})
     by_face = {row[0]: row for row in face_presence}
+    assert [row[0] for row in face_presence] == ["Total", "A", "BL", "BT", "BB", "BR", "C"]
+    assert by_face["Total"][1] == 4
+    assert by_face["Total"][2:8] == (2, 0.5, 2, 0.5, 0, 0.0)
     assert by_face["A"][1] == 4
     assert by_face["A"][2:8] == (1, 0.25, 1, 0.25, 0, 0.0)
     assert by_face["C"][2:8] == (1, 0.25, 0, 0.0, 0, 0.0)

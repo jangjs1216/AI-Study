@@ -69,6 +69,7 @@ DEFECT_COLORS = {
 }
 
 MAIN_FILTER_CACHE_VERSION = "main_filter_v3"
+DEFAULT_PIXEL_SCALE_UM = 13.0
 OPENCV_JBF_INSTALL_HINT = "OpenCV Joint Bilateral Filter는 opencv-contrib-python의 cv2.ximgproc가 필요합니다."
 
 KOREAN_FONT_CANDIDATES = [
@@ -167,12 +168,15 @@ class ImageViewer:
         self.cluster_image_label: ttk.Label | None = None
         self.refined_image_label: ttk.Label | None = None
         self.cluster_stats_label: ttk.Label | None = None
+        self.size_filtering_check: ttk.Checkbutton | None = None
+        self.size_threshold_entry: ttk.Entry | None = None
         self.adjusted_photo: ImageTk.PhotoImage | None = None
         self.cluster_photo: ImageTk.PhotoImage | None = None
         self.refined_photo: ImageTk.PhotoImage | None = None
         self.original_array: np.ndarray | None = None
         self.raw_array: np.ndarray | None = None
         self.mask_array: np.ndarray | None = None
+        self.current_scale_um = DEFAULT_PIXEL_SCALE_UM
         self.current_path: Path | None = None
         self.current_meta = ""
         self.source_paths: dict[str, Path] = {}
@@ -206,6 +210,9 @@ class ImageViewer:
         self.jbf_morph_close_var = tk.IntVar(value=5)
         self.jbf_blur_kernel_var = tk.IntVar(value=3)
         self.jbf_threshold_var = tk.DoubleVar(value=230.0)
+        self.size_measurement_var = tk.BooleanVar(value=False)
+        self.size_filtering_var = tk.BooleanVar(value=False)
+        self.size_threshold_var = tk.StringVar(value="0")
 
     def _ensure_window(self) -> None:
         if self.window is not None and self.window.winfo_exists():
@@ -282,6 +289,8 @@ class ImageViewer:
         param_notebook.add(refine_tab, text="Refinement")
         direction_tab = ttk.Frame(param_notebook, padding=(8, 6))
         param_notebook.add(direction_tab, text="Directional")
+        visualization_tab = ttk.Frame(param_notebook, padding=(8, 6))
+        param_notebook.add(visualization_tab, text="Visualization")
         kmeans_row = ttk.Frame(kmeans_tab)
         kmeans_row.pack(side=tk.TOP, fill=tk.X)
         ttk.Checkbutton(
@@ -338,6 +347,29 @@ class ImageViewer:
         )
         cancel_radius_scale.pack(side=tk.LEFT, padx=(0, 16))
         ttk.Label(direction_row, text="mask 방향과 수직인 주변 픽셀로 선형 성분을 상쇄").pack(side=tk.LEFT)
+
+        visualization_row = ttk.Frame(visualization_tab)
+        visualization_row.pack(side=tk.TOP, fill=tk.X)
+        ttk.Checkbutton(
+            visualization_row,
+            text="Size-Measurement",
+            variable=self.size_measurement_var,
+            command=self.on_size_measurement_toggle,
+        ).pack(side=tk.LEFT, padx=(0, 16))
+        self.size_filtering_check = ttk.Checkbutton(
+            visualization_row,
+            text="Size-Filtering",
+            variable=self.size_filtering_var,
+            command=self.on_size_filtering_toggle,
+        )
+        self.size_filtering_check.pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Label(visualization_row, text="Size-Threshold (mm^2)").pack(side=tk.LEFT, padx=(0, 4))
+        self.size_threshold_entry = ttk.Entry(visualization_row, textvariable=self.size_threshold_var, width=10)
+        self.size_threshold_entry.pack(side=tk.LEFT, padx=(0, 12))
+        self.size_threshold_entry.bind("<KeyRelease>", lambda _event: self.schedule_render())
+        self.size_threshold_entry.bind("<FocusOut>", lambda _event: self.schedule_render())
+        ttk.Label(visualization_row, text="area = pixels * (scale / 1000)^2").pack(side=tk.LEFT)
+        self.update_size_controls_state()
 
         basic_refine_row = ttk.Frame(refine_tab)
         basic_refine_row.pack(side=tk.TOP, fill=tk.X)
@@ -548,6 +580,37 @@ class ImageViewer:
         self.cluster_stats_label = ttk.Label(self.window, text="", anchor="w", justify="left", wraplength=1500)
         self.cluster_stats_label.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 8))
 
+    def update_size_controls_state(self) -> None:
+        measurement_enabled = bool(self.size_measurement_var.get())
+        filtering_enabled = measurement_enabled and bool(self.size_filtering_var.get())
+        if self.size_filtering_check is not None:
+            if measurement_enabled:
+                self.size_filtering_check.state(["!disabled"])
+            else:
+                self.size_filtering_check.state(["disabled"])
+        if self.size_threshold_entry is not None:
+            if filtering_enabled:
+                self.size_threshold_entry.state(["!disabled"])
+            else:
+                self.size_threshold_entry.state(["disabled"])
+
+    def on_size_measurement_toggle(self) -> None:
+        self.update_size_controls_state()
+        self.schedule_render()
+
+    def on_size_filtering_toggle(self) -> None:
+        self.update_size_controls_state()
+        self.schedule_render()
+
+    @staticmethod
+    def normalize_scale_um(scale_um: float | None) -> float:
+        if scale_um is None:
+            return DEFAULT_PIXEL_SCALE_UM
+        value = safe_float(scale_um)
+        if not np.isfinite(value) or value <= 0:
+            return DEFAULT_PIXEL_SCALE_UM
+        return value
+
     def show_error(self, message: str) -> None:
         self._ensure_window()
         assert self.window is not None and self.meta_label is not None
@@ -563,7 +626,7 @@ class ImageViewer:
         self.window.deiconify()
         self.window.lift()
 
-    def update(self, image_paths: dict[str, Path], meta_text: str) -> None:
+    def update(self, image_paths: dict[str, Path], meta_text: str, scale_um: float | None = None) -> None:
         self._ensure_window()
         assert self.window is not None and self.meta_label is not None
 
@@ -571,6 +634,7 @@ class ImageViewer:
             self.show_error(f"{meta_text}\n\n분석 가능한 이미지 경로가 없습니다.")
             return
 
+        self.current_scale_um = self.normalize_scale_um(scale_um)
         previous_source = self.source_var.get()
         self.source_paths = image_paths
         if self.source_combo is not None:
@@ -643,6 +707,10 @@ class ImageViewer:
         self.jbf_morph_close_var.set(5)
         self.jbf_blur_kernel_var.set(3)
         self.jbf_threshold_var.set(230.0)
+        self.size_measurement_var.set(False)
+        self.size_filtering_var.set(False)
+        self.size_threshold_var.set("0")
+        self.update_size_controls_state()
         self.overlap_var.set(False)
         self.active_filter_pipeline = None
         self.render_images()
@@ -735,6 +803,18 @@ class ImageViewer:
             self.window.after_cancel(self.render_after_id)
         self.render_after_id = self.window.after(120, self.render_images)
 
+    def parse_size_threshold(self) -> float:
+        raw = self.size_threshold_var.get().strip()
+        if not raw:
+            return 0.0
+        try:
+            value = float(raw)
+        except ValueError:
+            return 0.0
+        if not np.isfinite(value):
+            return 0.0
+        return max(value, 0.0)
+
     def render_images(self) -> None:
         self.render_after_id = None
         if self.original_array is None:
@@ -747,6 +827,9 @@ class ImageViewer:
         base, correction_text = self.make_analysis_base()
         angle_enabled = bool(self.refine_angle_var.get())
         ratio_enabled = bool(self.refine_ratio_var.get())
+        size_measurement_enabled = bool(self.size_measurement_var.get())
+        size_filtering_enabled = size_measurement_enabled and bool(self.size_filtering_var.get())
+        size_threshold = self.parse_size_threshold()
         if self.active_filter_pipeline is not None and self.pipeline_preview_renderer is not None:
             pipeline = self.active_pipeline_from_controls()
             adjusted, clustered, refined, stats_text = self.pipeline_preview_renderer(base, self.mask_array, pipeline)
@@ -778,6 +861,25 @@ class ImageViewer:
                 refine_min_area=int(self.refine_min_area_var.get()),
                 remove_border_background=bool(self.remove_border_bg_var.get()),
             )
+        size_stats_text = ""
+        size_filter_stats_text = ""
+        if size_filtering_enabled:
+            clustered, cluster_size_text = self.apply_size_filter_to_result(
+                clustered,
+                scale_um=self.current_scale_um,
+                threshold_area=size_threshold,
+            )
+            refined, refine_size_text = self.apply_size_filter_to_result(
+                refined,
+                scale_um=self.current_scale_um,
+                threshold_area=size_threshold,
+            )
+            size_filter_stats_text = (
+                f", filter=on(th={size_threshold:g}mm^2, "
+                f"K-Means {cluster_size_text}, Refinement {refine_size_text})"
+            )
+        elif size_measurement_enabled:
+            size_stats_text = f" | size_measure=on, scale={self.current_scale_um:g}um/px"
         if self.overlap_var.get():
             clustered_display = self.overlay_result(adjusted, clustered, alpha=0.8)
             refined_display = self.overlay_result(adjusted, refined, alpha=0.8)
@@ -785,11 +887,35 @@ class ImageViewer:
             clustered_display = clustered
             refined_display = refined
         if ratio_enabled and self.mask_array is not None:
+            ratio_mask = self.mask_array
+            if size_filtering_enabled:
+                filtered_mask = self.result_nonzero_mask(refined)
+                if filtered_mask.any():
+                    ratio_mask = filtered_mask
             refined_display = self.draw_angle_overlay(
                 refined_display,
-                self.mask_array,
+                ratio_mask,
                 show_angle=False,
                 show_ratio=True,
+            )
+        if size_measurement_enabled:
+            clustered_display, cluster_label_text = self.draw_size_measurement_overlay(
+                clustered_display,
+                clustered,
+                scale_um=self.current_scale_um,
+                threshold_area=size_threshold,
+                filter_enabled=size_filtering_enabled,
+            )
+            refined_display, refine_label_text = self.draw_size_measurement_overlay(
+                refined_display,
+                refined,
+                scale_um=self.current_scale_um,
+                threshold_area=size_threshold,
+                filter_enabled=size_filtering_enabled,
+            )
+            size_stats_text = (
+                f" | size_measure=on, scale={self.current_scale_um:g}um/px, "
+                f"K-Means {cluster_label_text}, Refinement {refine_label_text}{size_filter_stats_text}"
             )
 
         self.adjusted_photo = ImageTk.PhotoImage(self.to_display_image(adjusted))
@@ -800,7 +926,7 @@ class ImageViewer:
         self.refined_image_label.config(image=self.refined_photo, text="")
         if self.cluster_stats_label is not None:
             self.cluster_stats_label.config(
-                text=f"contrast={contrast:.2f}, blur={blur_radius:.1f}, K={k}, mask_only={self.cluster_mask_only_var.get()}, overlap={self.overlap_var.get()} | {correction_text} | {stats_text}"
+                text=f"contrast={contrast:.2f}, blur={blur_radius:.1f}, K={k}, mask_only={self.cluster_mask_only_var.get()}, overlap={self.overlap_var.get()} | {correction_text} | {stats_text}{size_stats_text}"
             )
 
     def make_analysis_base(self) -> tuple[np.ndarray, str]:
@@ -845,6 +971,183 @@ class ImageViewer:
         alpha = float(np.clip(alpha, 0.0, 1.0))
         out[overlay_mask] = (1.0 - alpha) * base_f[overlay_mask] + alpha * overlay_f[overlay_mask]
         return np.clip(out, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def result_nonzero_mask(array: np.ndarray) -> np.ndarray:
+        if array.ndim != 3:
+            return np.zeros(array.shape[:2], dtype=bool)
+        return np.any(array.astype(np.uint8) > 0, axis=2)
+
+    @staticmethod
+    def pixel_area_factor(scale_um: float) -> float:
+        scale = ImageViewer.normalize_scale_um(scale_um)
+        return (scale / 1000.0) ** 2
+
+    @staticmethod
+    def format_area_value(area: float) -> str:
+        if area >= 100:
+            return f"{area:.1f}"
+        if area >= 1:
+            return f"{area:.3f}"
+        return f"{area:.4g}"
+
+    @classmethod
+    def result_component_group_masks(cls, array: np.ndarray, max_color_groups: int = 32) -> list[np.ndarray]:
+        nonzero = cls.result_nonzero_mask(array)
+        if not nonzero.any():
+            return []
+
+        pixels = array[nonzero].reshape(-1, 3).astype(np.uint8)
+        if len(pixels) > 5000:
+            sample_idx = np.linspace(0, len(pixels) - 1, num=5000, dtype=np.int64)
+            if len(np.unique(pixels[sample_idx], axis=0)) > max_color_groups:
+                return [nonzero]
+
+        colors = np.unique(pixels, axis=0)
+        if len(colors) > max_color_groups:
+            return [nonzero]
+        return [np.all(array == color.reshape(1, 1, 3), axis=2) for color in colors]
+
+    @classmethod
+    def size_component_records(cls, array: np.ndarray, min_pixels: int = 1) -> list[dict[str, float]]:
+        records: list[dict[str, float]] = []
+        min_pixels = int(max(min_pixels, 1))
+        for group_mask in cls.result_component_group_masks(array):
+            if cv2 is not None:
+                num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+                    group_mask.astype(np.uint8),
+                    connectivity=8,
+                )
+                for label_id in range(1, num_labels):
+                    pixel_count = int(stats[label_id, cv2.CC_STAT_AREA])
+                    if pixel_count < min_pixels:
+                        continue
+                    x0 = int(stats[label_id, cv2.CC_STAT_LEFT])
+                    y0 = int(stats[label_id, cv2.CC_STAT_TOP])
+                    width = int(stats[label_id, cv2.CC_STAT_WIDTH])
+                    height = int(stats[label_id, cv2.CC_STAT_HEIGHT])
+                    cx, cy = (float(v) for v in centroids[label_id])
+                    records.append(
+                        {
+                            "pixel_count": float(pixel_count),
+                            "x0": float(x0),
+                            "y0": float(y0),
+                            "x1": float(x0 + width - 1),
+                            "y1": float(y0 + height - 1),
+                            "cx": cx,
+                            "cy": cy,
+                        }
+                    )
+                continue
+
+            for coords in cls.connected_components_bool(group_mask, min_area=min_pixels):
+                yy = coords[:, 0]
+                xx = coords[:, 1]
+                records.append(
+                    {
+                        "pixel_count": float(len(coords)),
+                        "x0": float(xx.min()),
+                        "y0": float(yy.min()),
+                        "x1": float(xx.max()),
+                        "y1": float(yy.max()),
+                        "cx": float(xx.mean()),
+                        "cy": float(yy.mean()),
+                    }
+                )
+
+        records.sort(key=lambda row: row["pixel_count"], reverse=True)
+        return records
+
+    @classmethod
+    def apply_size_filter_to_result(
+        cls,
+        array: np.ndarray,
+        scale_um: float,
+        threshold_area: float,
+    ) -> tuple[np.ndarray, str]:
+        threshold = max(float(threshold_area), 0.0)
+        factor = cls.pixel_area_factor(scale_um)
+        nonzero = cls.result_nonzero_mask(array)
+        if not nonzero.any():
+            return array, "kept=0/0"
+
+        keep_mask = np.zeros(array.shape[:2], dtype=bool)
+        total_components = 0
+        kept_components = 0
+        for group_mask in cls.result_component_group_masks(array):
+            if cv2 is not None:
+                num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+                    group_mask.astype(np.uint8),
+                    connectivity=8,
+                )
+                keep_ids = []
+                for label_id in range(1, num_labels):
+                    total_components += 1
+                    pixel_count = int(stats[label_id, cv2.CC_STAT_AREA])
+                    if pixel_count * factor > threshold:
+                        keep_ids.append(label_id)
+                        kept_components += 1
+                if keep_ids:
+                    keep_mask |= np.isin(labels, np.asarray(keep_ids, dtype=labels.dtype))
+                continue
+
+            for coords in cls.connected_components_bool(group_mask, min_area=1):
+                total_components += 1
+                if len(coords) * factor > threshold:
+                    keep_mask[coords[:, 0], coords[:, 1]] = True
+                    kept_components += 1
+
+        filtered = array.copy()
+        filtered[nonzero & ~keep_mask] = 0
+        return filtered, f"kept={kept_components}/{total_components}"
+
+    @classmethod
+    def draw_size_measurement_overlay(
+        cls,
+        display_array: np.ndarray,
+        measurement_source: np.ndarray,
+        scale_um: float,
+        threshold_area: float = 0.0,
+        filter_enabled: bool = False,
+        max_components: int = 80,
+    ) -> tuple[np.ndarray, str]:
+        if display_array.shape[:2] != measurement_source.shape[:2]:
+            return display_array, "labels=0/0"
+
+        factor = cls.pixel_area_factor(scale_um)
+        threshold = max(float(threshold_area), 0.0)
+        records = cls.size_component_records(measurement_source)
+        total = len(records)
+        if filter_enabled:
+            records = [row for row in records if row["pixel_count"] * factor > threshold]
+        if not records:
+            return display_array, f"labels=0/{total}"
+
+        image = Image.fromarray(display_array.astype(np.uint8).copy(), mode="RGB")
+        draw = ImageDraw.Draw(image)
+        h, w = display_array.shape[:2]
+        line_width = max(1, int(round(min(h, w) / 420)))
+        shown = 0
+        for record in records[:max_components]:
+            pixel_count = int(record["pixel_count"])
+            area = pixel_count * factor
+            x0 = int(record["x0"])
+            y0 = int(record["y0"])
+            x1 = int(record["x1"])
+            y1 = int(record["y1"])
+            draw.rectangle([x0, y0, x1, y1], outline=(255, 255, 255), width=line_width)
+            label_x = max(0, min(w - 150, x0))
+            label_y = max(0, min(h - 34, y0 - 30))
+            cls.draw_readable_text(
+                draw,
+                (float(label_x), float(label_y)),
+                [f"px={pixel_count}", f"A={cls.format_area_value(area)} mm^2"],
+                fill=(255, 255, 255),
+            )
+            shown += 1
+
+        suffix = f", th={threshold:g}mm^2" if filter_enabled else ""
+        return np.asarray(image, dtype=np.uint8), f"labels={shown}/{total}{suffix}"
 
     @staticmethod
     def draw_readable_text(
@@ -3922,6 +4225,24 @@ class GroupCameraFeatureExplorer:
             return ""
         return f"{number * 100:.2f}%"
 
+    @staticmethod
+    def scale_um_from_row(row: pd.Series) -> float:
+        for column in [
+            "scale",
+            "pixel_scale",
+            "pixel_size_um",
+            "scale_um",
+            "um_per_px",
+            "pixel_um",
+            "pixel_size",
+        ]:
+            if column not in row.index:
+                continue
+            value = safe_float(row.get(column))
+            if np.isfinite(value) and value > 0:
+                return value
+        return DEFAULT_PIXEL_SCALE_UM
+
     def on_pick(self, event) -> None:  # noqa: ANN001 - matplotlib event
         artist = event.artist
         if artist not in self.artist_rows or not len(event.ind):
@@ -3955,7 +4276,7 @@ class GroupCameraFeatureExplorer:
             missing_text = "\n".join(missing_sources) if missing_sources else "image_path/mask_raw_path/mask_path 값이 없습니다."
             self.image_viewer.show_error(f"{meta}\n\n이미지 파일을 찾지 못했습니다:\n{missing_text}")
             return
-        self.image_viewer.update(image_paths, meta)
+        self.image_viewer.update(image_paths, meta, scale_um=self.scale_um_from_row(row))
 
     def resolve_image_path(self, value: object) -> Path | None:
         if pd.isna(value):

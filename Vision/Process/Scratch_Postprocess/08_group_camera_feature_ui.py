@@ -2860,6 +2860,7 @@ class GroupCameraFeatureExplorer:
             "kmeans_enabled": tk.BooleanVar(),
             "k": tk.IntVar(),
             "cluster_select": tk.StringVar(),
+            "remove_border_background": tk.BooleanVar(),
             "post_order": tk.StringVar(),
             "refine_enabled": tk.BooleanVar(),
             "refine_kernel": tk.IntVar(),
@@ -2882,11 +2883,18 @@ class GroupCameraFeatureExplorer:
         def set_vars(pipeline: dict[str, object]) -> None:
             defaults = self.default_filter_pipeline(str(pipeline.get("name", "Pipeline")))
             merged = {**defaults, **pipeline}
+            cluster_select = str(merged.get("cluster_select", "all") or "all")
+            merged["remove_border_background"] = cluster_select == "border_background"
+            if cluster_select == "border_background":
+                merged["cluster_select"] = "all"
             for key, variable in vars_map.items():
                 variable.set(merged.get(key, defaults.get(key, "")))
 
         def collect_pipeline() -> dict[str, object]:
             name = str(vars_map["name"].get()).strip() or "Unnamed Filter"
+            cluster_select = str(vars_map["cluster_select"].get() or "all")
+            if bool(vars_map["remove_border_background"].get()):
+                cluster_select = "border_background"
             return {
                 "name": name,
                 "source": str(vars_map["source"].get() or "image_path"),
@@ -2896,7 +2904,7 @@ class GroupCameraFeatureExplorer:
                 "blur": float(vars_map["blur"].get()),
                 "kmeans_enabled": bool(vars_map["kmeans_enabled"].get()),
                 "k": int(vars_map["k"].get()),
-                "cluster_select": str(vars_map["cluster_select"].get() or "all"),
+                "cluster_select": cluster_select,
                 "post_order": str(vars_map["post_order"].get() or "jbf_then_refine"),
                 "refine_enabled": bool(vars_map["refine_enabled"].get()),
                 "refine_kernel": int(vars_map["refine_kernel"].get()),
@@ -3040,6 +3048,7 @@ class GroupCameraFeatureExplorer:
         kmeans.grid(row=row, column=0, columnspan=2, sticky="ew", pady=4)
         row += 1
         ttk.Checkbutton(kmeans, text="Use K-Means", variable=vars_map["kmeans_enabled"]).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(kmeans, text="외곽 배경 제거", variable=vars_map["remove_border_background"]).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(kmeans, text="K").pack(side=tk.LEFT, padx=(0, 4))
         tk.Scale(kmeans, from_=1, to=8, resolution=1, orient=tk.HORIZONTAL, variable=vars_map["k"], length=120).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(kmeans, text="Cluster").pack(side=tk.LEFT, padx=(0, 4))
@@ -3047,7 +3056,7 @@ class GroupCameraFeatureExplorer:
             kmeans,
             textvariable=vars_map["cluster_select"],
             state="readonly",
-            values=["all", "border_background", "darkest", "brightest", "largest", "smallest"],
+            values=["all", "darkest", "brightest", "largest", "smallest"],
             width=12,
         ).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(kmeans, text="Order").pack(side=tk.LEFT, padx=(0, 4))
@@ -3678,25 +3687,27 @@ class GroupCameraFeatureExplorer:
         failed = mode in {"opencv-jbf-unavailable", "opencv-jbf-error"}
         return refined_mask, f"jbf={mode}", failed
 
-    def render_filter_pipeline_preview(
+    def run_filter_pipeline_on_arrays(
         self,
         source_array: np.ndarray,
-        mask_array: np.ndarray | None,
+        valid_mask: np.ndarray,
         pipeline: dict[str, object],
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+        source_name: str = "",
+    ) -> dict[str, object]:
         start = time.perf_counter()
         adjusted = ImageViewer.apply_blur(
             ImageViewer.apply_contrast(source_array, float(pipeline.get("contrast", 1.0))),
             float(pipeline.get("blur", 0.0)),
         )
         h, w, _ = adjusted.shape
-        if mask_array is not None and mask_array.shape == (h, w) and mask_array.any():
-            valid_mask = mask_array.astype(bool)
-        else:
-            valid_mask = np.ones((h, w), dtype=bool)
+        valid_mask = valid_mask.astype(bool)
+        if valid_mask.shape != (h, w):
+            valid_mask = np.zeros((h, w), dtype=bool)
 
         k = int(pipeline.get("k", 1)) if bool(pipeline.get("kmeans_enabled", False)) else 1
         mode_parts: list[str] = []
+        if source_name:
+            mode_parts.append(f"source={source_name}")
         palette = np.array(
             [
                 [31, 119, 180],
@@ -3711,6 +3722,23 @@ class GroupCameraFeatureExplorer:
             dtype=np.uint8,
         )
         clustered = np.zeros((h, w, 3), dtype=np.uint8)
+        if not valid_mask.any():
+            refined = np.zeros((h, w, 3), dtype=np.uint8)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            mode_text = " | ".join(mode_parts + ["empty_mask"])
+            stats_text = f"order=empty_mask, raw_area=0, alive_area=0, status=dead, elapsed={elapsed_ms:.1f}ms | {mode_text}"
+            return {
+                "adjusted": adjusted,
+                "clustered": clustered,
+                "refined": refined,
+                "status": "dead",
+                "raw_area": 0,
+                "alive_area": 0,
+                "elapsed_ms": float(elapsed_ms),
+                "mode": mode_text,
+                "stats_text": stats_text,
+            }
+
         gate_pass, gate_text, _bbox_ratio = self.bbox_gate_decision(valid_mask, pipeline)
         mode_parts.append(gate_text)
         if not gate_pass:
@@ -3719,11 +3747,22 @@ class GroupCameraFeatureExplorer:
             refined = np.zeros((h, w, 3), dtype=np.uint8)
             refined[valid_mask] = np.array([44, 160, 44], dtype=np.uint8)
             elapsed_ms = (time.perf_counter() - start) * 1000
+            mode_text = " | ".join(mode_parts)
             stats_text = (
                 f"order=skipped_by_bbox_gate, raw_area={raw_area}, alive_area={raw_area}, "
-                f"status=alive, elapsed={elapsed_ms:.1f}ms | {' | '.join(mode_parts)}"
+                f"status=alive, elapsed={elapsed_ms:.1f}ms | {mode_text}"
             )
-            return adjusted, clustered, refined, stats_text
+            return {
+                "adjusted": adjusted,
+                "clustered": clustered,
+                "refined": refined,
+                "status": "alive",
+                "raw_area": raw_area,
+                "alive_area": raw_area,
+                "elapsed_ms": float(elapsed_ms),
+                "mode": mode_text,
+                "stats_text": stats_text,
+            }
 
         if k > 1:
             labels_2d, centers, counts, kmeans_ms = self.kmeans_labels_for_filter(adjusted, valid_mask, k)
@@ -3777,12 +3816,43 @@ class GroupCameraFeatureExplorer:
             refined[work_mask] = np.array([44, 160, 44], dtype=np.uint8)
         elapsed_ms = (time.perf_counter() - start) * 1000
         alive_area = int(work_mask.sum()) if not failed else 0
+        status = "unknown" if failed else ("alive" if alive_area > 0 else "dead")
+        mode_text = " | ".join(mode_parts)
         stats_text = (
             f"order={order}, raw_area={raw_area}, alive_area={alive_area}, "
-            f"status={'unknown' if failed else ('alive' if alive_area > 0 else 'dead')}, "
-            f"elapsed={elapsed_ms:.1f}ms | {' | '.join(mode_parts)}"
+            f"status={status}, elapsed={elapsed_ms:.1f}ms | {mode_text}"
         )
-        return adjusted, clustered, refined, stats_text
+        return {
+            "adjusted": adjusted,
+            "clustered": clustered,
+            "refined": refined,
+            "status": status,
+            "raw_area": raw_area,
+            "alive_area": alive_area,
+            "elapsed_ms": float(elapsed_ms),
+            "mode": mode_text,
+            "stats_text": stats_text,
+        }
+
+    def render_filter_pipeline_preview(
+        self,
+        source_array: np.ndarray,
+        mask_array: np.ndarray | None,
+        pipeline: dict[str, object],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+        h, w, _ = source_array.shape
+        if mask_array is not None and mask_array.shape == (h, w) and mask_array.any():
+            valid_mask = mask_array.astype(bool)
+        else:
+            valid_mask = np.ones((h, w), dtype=bool)
+        result = self.run_filter_pipeline_on_arrays(source_array, valid_mask, pipeline)
+        adjusted = result["adjusted"]
+        clustered = result["clustered"]
+        refined = result["refined"]
+        assert isinstance(adjusted, np.ndarray)
+        assert isinstance(clustered, np.ndarray)
+        assert isinstance(refined, np.ndarray)
+        return adjusted, clustered, refined, str(result["stats_text"])
 
     def evaluate_main_filter_row(self, row: pd.Series, pipeline: dict[str, object], params_key: tuple[object, ...]) -> dict[str, object]:
         row_id = int(row.get("row_id"))
@@ -3814,7 +3884,6 @@ class GroupCameraFeatureExplorer:
             self.set_main_filter_result_cache(cache_key, result)
             return result
 
-        start = time.perf_counter()
         try:
             guide = self.cached_main_filter_rgb_array(source_path, None, source_token)
             if guide is None:
@@ -3835,67 +3904,19 @@ class GroupCameraFeatureExplorer:
                     "cache_hit": False,
                 }
             else:
-                mode_parts = [f"source={source_name}"]
-                gate_pass, gate_text, _bbox_ratio = self.bbox_gate_decision(mask, pipeline)
-                mode_parts.append(gate_text)
-                if not gate_pass:
-                    elapsed_ms = (time.perf_counter() - start) * 1000
-                    result = {
-                        "filter_name": filter_name,
-                        "status": "alive",
-                        "raw_area": mask_area,
-                        "alive_area": mask_area,
-                        "elapsed_ms": float(elapsed_ms),
-                        "mode": " | ".join(mode_parts),
-                        "cache_hit": False,
-                    }
-                    self.set_main_filter_result_cache(cache_key, result)
-                    return result
-
-                adjusted = ImageViewer.apply_blur(
-                    ImageViewer.apply_contrast(guide, float(pipeline.get("contrast", 1.0))),
-                    float(pipeline.get("blur", 0.0)),
+                pipeline_result = self.run_filter_pipeline_on_arrays(
+                    guide,
+                    mask,
+                    pipeline,
+                    source_name=source_name,
                 )
-                if bool(pipeline.get("kmeans_enabled", False)) and int(pipeline.get("k", 1)) > 1:
-                    labels_2d, centers, counts, kmeans_ms = self.kmeans_labels_for_filter(adjusted, mask, int(pipeline.get("k", 2)))
-                    candidate, cluster_text = self.select_kmeans_candidate(
-                        labels_2d,
-                        mask,
-                        counts,
-                        str(pipeline.get("cluster_select", "all")),
-                        centers=centers,
-                        image_array=adjusted,
-                    )
-                    mode_parts.append(f"kmeans={kmeans_ms:.1f}ms")
-                    mode_parts.append(cluster_text)
-                else:
-                    candidate = mask.copy()
-                    mode_parts.append("kmeans=off")
-
-                raw_area = int(candidate.sum())
-                work_mask = candidate
-                failed = False
-                order = str(pipeline.get("post_order", "jbf_then_refine"))
-                if order == "refine_then_jbf":
-                    work_mask, refine_mode = self.apply_filter_refinement(work_mask, mask, pipeline)
-                    mode_parts.append(refine_mode)
-                    work_mask, jbf_mode, failed = self.apply_filter_jbf(work_mask, adjusted, mask, pipeline)
-                    mode_parts.append(jbf_mode)
-                else:
-                    work_mask, jbf_mode, failed = self.apply_filter_jbf(work_mask, adjusted, mask, pipeline)
-                    mode_parts.append(jbf_mode)
-                    work_mask, refine_mode = self.apply_filter_refinement(work_mask, mask, pipeline)
-                    mode_parts.append(refine_mode)
-
-                elapsed_ms = (time.perf_counter() - start) * 1000
-                alive_area = int(work_mask.sum())
                 result = {
                     "filter_name": filter_name,
-                    "status": "unknown" if failed else ("alive" if alive_area > 0 else "dead"),
-                    "raw_area": raw_area,
-                    "alive_area": 0 if failed else alive_area,
-                    "elapsed_ms": float(elapsed_ms),
-                    "mode": " | ".join(mode_parts),
+                    "status": str(pipeline_result.get("status", "unknown")),
+                    "raw_area": int(pipeline_result.get("raw_area", 0)),
+                    "alive_area": int(pipeline_result.get("alive_area", 0)),
+                    "elapsed_ms": float(pipeline_result.get("elapsed_ms", 0.0)),
+                    "mode": str(pipeline_result.get("mode", "")),
                     "cache_hit": False,
                 }
         except Exception as exc:  # noqa: BLE001 - batch evaluation should continue per row

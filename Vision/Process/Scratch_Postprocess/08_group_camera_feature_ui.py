@@ -69,6 +69,19 @@ DEFECT_COLORS = {
     "기타": "#4c78a8",
 }
 
+FILTER_STATUS_COLORS = {
+    "alive": "#2ca02c",
+    "dead": "#d62728",
+    "skipped": "#1f77b4",
+    "unknown": "#9e9e9e",
+}
+FILTER_STATUS_LINEWIDTHS = {
+    "alive": 1.35,
+    "dead": 1.35,
+    "skipped": 1.45,
+    "unknown": 0.5,
+}
+
 MAIN_FILTER_CACHE_VERSION = "main_filter_v3"
 DEFAULT_PIXEL_SCALE_UM = 13.0
 UI_STATE_PATH = Path(__file__).with_name("08_group_camera_feature_ui_state.json")
@@ -2777,6 +2790,7 @@ class GroupCameraFeatureExplorer:
             "group",
             "filter_alive",
             "filter_dead",
+            "filter_skipped",
             "filter_eval",
             "filter_unknown",
             "filter_alive_rate",
@@ -3745,20 +3759,20 @@ class GroupCameraFeatureExplorer:
             raw_area = int(valid_mask.sum())
             clustered[valid_mask] = adjusted[valid_mask]
             refined = np.zeros((h, w, 3), dtype=np.uint8)
-            refined[valid_mask] = np.array([44, 160, 44], dtype=np.uint8)
+            refined[valid_mask] = np.array([31, 119, 180], dtype=np.uint8)
             elapsed_ms = (time.perf_counter() - start) * 1000
             mode_text = " | ".join(mode_parts)
             stats_text = (
-                f"order=skipped_by_bbox_gate, raw_area={raw_area}, alive_area={raw_area}, "
-                f"status=alive, elapsed={elapsed_ms:.1f}ms | {mode_text}"
+                f"order=skipped_by_bbox_gate, raw_area={raw_area}, alive_area=0, "
+                f"status=skipped, elapsed={elapsed_ms:.1f}ms | {mode_text}"
             )
             return {
                 "adjusted": adjusted,
                 "clustered": clustered,
                 "refined": refined,
-                "status": "alive",
+                "status": "skipped",
                 "raw_area": raw_area,
-                "alive_area": raw_area,
+                "alive_area": 0,
                 "elapsed_ms": float(elapsed_ms),
                 "mode": mode_text,
                 "stats_text": stats_text,
@@ -4034,12 +4048,13 @@ class GroupCameraFeatureExplorer:
         statuses = pd.Series([str(result.get("status", "unknown")) for result in self.main_filter_results.values()])
         alive = int((statuses == "alive").sum())
         dead = int((statuses == "dead").sum())
+        skipped = int((statuses == "skipped").sum())
         unknown = int((statuses == "unknown").sum())
         self.main_filter_enable_var.set(True)
         self.refresh_plot()
         self.status_var.set(
-            f"Filter 평가 완료 | {sampled_text} | filter={filter_name} | alive={alive}, dead={dead}, unknown={unknown}, "
-            f"cache_hit={cache_hits}/{total}, elapsed={elapsed_ms:.1f}ms"
+            f"Filter 평가 완료 | {sampled_text} | filter={filter_name} | alive={alive}, dead={dead}, "
+            f"skipped={skipped}, unknown={unknown}, cache_hit={cache_hits}/{total}, elapsed={elapsed_ms:.1f}ms"
         )
 
     def attach_main_filter_results(self, plot_df: pd.DataFrame) -> pd.DataFrame:
@@ -4265,8 +4280,8 @@ class GroupCameraFeatureExplorer:
         for defect_type, part in plot_df.groupby("defect_type", sort=False):
             color = DEFECT_COLORS.get(defect_type, "#666666")
             if self.main_filter_enable_var.get() and "filter_status" in part.columns:
-                edgecolors = part["filter_status"].map({"alive": "#2ca02c", "dead": "#d62728", "unknown": "#9e9e9e"}).fillna("#9e9e9e").tolist()
-                linewidths = part["filter_status"].map({"alive": 1.35, "dead": 1.35, "unknown": 0.5}).fillna(0.5).tolist()
+                edgecolors = part["filter_status"].map(FILTER_STATUS_COLORS).fillna(FILTER_STATUS_COLORS["unknown"]).tolist()
+                linewidths = part["filter_status"].map(FILTER_STATUS_LINEWIDTHS).fillna(FILTER_STATUS_LINEWIDTHS["unknown"]).tolist()
             else:
                 edgecolors = "white"
                 linewidths = 0.45
@@ -4289,12 +4304,14 @@ class GroupCameraFeatureExplorer:
         if self.main_filter_enable_var.get() and "filter_status" in plot_df.columns:
             alive = int((plot_df["filter_status"] == "alive").sum())
             dead = int((plot_df["filter_status"] == "dead").sum())
+            skipped = int((plot_df["filter_status"] == "skipped").sum())
             unknown = int((plot_df["filter_status"] == "unknown").sum())
             evaluated = alive + dead
             scope_text = f", {self.main_filter_scope_text}" if self.main_filter_scope_text else ""
-            filter_status = f" | Filter eval={evaluated}, alive={alive}, dead={dead}, unknown={unknown}{scope_text}"
-            self.ax.scatter([], [], s=54, facecolors="none", edgecolors="#2ca02c", linewidths=1.5, label=f"Filter Alive ({alive})")
-            self.ax.scatter([], [], s=54, facecolors="none", edgecolors="#d62728", linewidths=1.5, label=f"Filter Dead ({dead})")
+            filter_status = f" | Filter eval={evaluated}, alive={alive}, dead={dead}, skipped={skipped}, unknown={unknown}{scope_text}"
+            self.ax.scatter([], [], s=54, facecolors="none", edgecolors=FILTER_STATUS_COLORS["alive"], linewidths=1.5, label=f"Filter Alive ({alive})")
+            self.ax.scatter([], [], s=54, facecolors="none", edgecolors=FILTER_STATUS_COLORS["dead"], linewidths=1.5, label=f"Filter Dead ({dead})")
+            self.ax.scatter([], [], s=54, facecolors="none", edgecolors=FILTER_STATUS_COLORS["skipped"], linewidths=1.5, label=f"Filter Skipped ({skipped})")
 
         for _, row in summary.iterrows():
             cat = (str(row["group"]), str(row["camera_mode"]))
@@ -4367,7 +4384,7 @@ class GroupCameraFeatureExplorer:
         for col in ["진불스크래치", "미세스크래치", "기타"]:
             if col not in summary.columns:
                 summary[col] = 0
-        for col in ["filter_eval", "filter_alive", "filter_dead", "filter_unknown", "filter_alive_rate"]:
+        for col in ["filter_eval", "filter_alive", "filter_dead", "filter_skipped", "filter_unknown", "filter_alive_rate"]:
             summary[col] = np.nan
         if "filter_status" in plot_df.columns:
             filter_counts = (
@@ -4381,13 +4398,14 @@ class GroupCameraFeatureExplorer:
                 .reset_index()
                 .rename_axis(None, axis=1)
             )
-            summary = summary.drop(columns=["filter_eval", "filter_alive", "filter_dead", "filter_unknown", "filter_alive_rate"], errors="ignore")
+            summary = summary.drop(columns=["filter_eval", "filter_alive", "filter_dead", "filter_skipped", "filter_unknown", "filter_alive_rate"], errors="ignore")
             summary = summary.merge(filter_counts, on=["group", "camera_mode"], how="left")
-            for status in ["alive", "dead", "unknown"]:
+            for status in ["alive", "dead", "skipped", "unknown"]:
                 if status not in summary.columns:
                     summary[status] = 0
             summary["filter_alive"] = pd.to_numeric(summary["alive"], errors="coerce").fillna(0).astype(int)
             summary["filter_dead"] = pd.to_numeric(summary["dead"], errors="coerce").fillna(0).astype(int)
+            summary["filter_skipped"] = pd.to_numeric(summary["skipped"], errors="coerce").fillna(0).astype(int)
             summary["filter_unknown"] = pd.to_numeric(summary["unknown"], errors="coerce").fillna(0).astype(int)
             summary["filter_eval"] = summary["filter_alive"] + summary["filter_dead"]
             summary["filter_alive_rate"] = summary["filter_alive"] / summary["filter_eval"].replace(0, np.nan)
@@ -4428,6 +4446,7 @@ class GroupCameraFeatureExplorer:
                 row["group"],
                 "" if pd.isna(row.get("filter_alive", np.nan)) else int(row.get("filter_alive", 0)),
                 "" if pd.isna(row.get("filter_dead", np.nan)) else int(row.get("filter_dead", 0)),
+                "" if pd.isna(row.get("filter_skipped", np.nan)) else int(row.get("filter_skipped", 0)),
                 "" if pd.isna(row.get("filter_eval", np.nan)) else int(row.get("filter_eval", 0)),
                 "" if pd.isna(row.get("filter_unknown", np.nan)) else int(row.get("filter_unknown", 0)),
                 "" if pd.isna(row.get("filter_alive_rate", np.nan)) else self.format_percent(row.get("filter_alive_rate")),

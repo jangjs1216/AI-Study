@@ -70,19 +70,24 @@ DEFECT_COLORS = {
 }
 
 FILTER_STATUS_COLORS = {
+    "k_alive": "#2ca02c",
+    "g_alive": "#ffbf00",
     "alive": "#2ca02c",
     "dead": "#d62728",
     "skipped": "#1f77b4",
     "unknown": "#9e9e9e",
 }
 FILTER_STATUS_LINEWIDTHS = {
+    "k_alive": 1.65,
+    "g_alive": 1.65,
     "alive": 1.35,
     "dead": 1.35,
     "skipped": 1.45,
     "unknown": 0.5,
 }
 
-MAIN_FILTER_CACHE_VERSION = "main_filter_v3"
+FILTER_ALIVE_STATUSES = {"alive", "k_alive", "g_alive"}
+MAIN_FILTER_CACHE_VERSION = "main_filter_v4"
 DEFAULT_PIXEL_SCALE_UM = 13.0
 UI_STATE_PATH = Path(__file__).with_name("08_group_camera_feature_ui_state.json")
 OPENCV_JBF_INSTALL_HINT = "OpenCV Joint Bilateral Filter는 opencv-contrib-python의 cv2.ximgproc가 필요합니다."
@@ -791,6 +796,13 @@ class ImageViewer:
         self.jbf_morph_close_var.set(int(pipeline.get("jbf_morph_close", 5)))
         self.jbf_blur_kernel_var.set(int(pipeline.get("jbf_blur_kernel", 3)))
         self.jbf_threshold_var.set(float(pipeline.get("jbf_threshold", 230.0)))
+        size_threshold_enabled = bool(pipeline.get("size_threshold_enabled", False))
+        self.size_measurement_var.set(size_threshold_enabled)
+        self.size_filtering_var.set(size_threshold_enabled)
+        self.color_filtering_var.set(False)
+        self.k_size_threshold_var.set(str(pipeline.get("k_size_threshold", 0.0)))
+        self.g_size_threshold_var.set(str(pipeline.get("g_size_threshold", 0.0)))
+        self.update_size_controls_state()
         if source_changed and self.original_array is not None:
             self.load_selected_source()
         else:
@@ -805,6 +817,8 @@ class ImageViewer:
             cluster_select = "all"
         else:
             cluster_select = existing_cluster_select
+        k_size_threshold = self.parse_nonnegative_float_text(self.k_size_threshold_var.get())
+        g_size_threshold = self.parse_nonnegative_float_text(self.g_size_threshold_var.get())
         pipeline.update(
             {
                 "source": self.source_var.get(),
@@ -831,6 +845,9 @@ class ImageViewer:
                 "jbf_morph_close": int(self.jbf_morph_close_var.get()),
                 "jbf_blur_kernel": int(self.jbf_blur_kernel_var.get()),
                 "jbf_threshold": float(self.jbf_threshold_var.get()),
+                "size_threshold_enabled": bool(self.size_filtering_var.get() or self.color_filtering_var.get()),
+                "k_size_threshold": float(k_size_threshold),
+                "g_size_threshold": float(g_size_threshold),
             }
         )
         pipeline.setdefault("name", "Patch Filter Preview")
@@ -1053,6 +1070,31 @@ class ImageViewer:
         if array.ndim != 3:
             return np.zeros(array.shape[:2], dtype=bool)
         return np.any(array.astype(np.uint8) > 0, axis=2)
+
+    @classmethod
+    def mask_component_area_summary(cls, mask: np.ndarray, scale_um: float) -> tuple[float, int]:
+        mask_bool = mask.astype(bool)
+        if not mask_bool.any():
+            return 0.0, 0
+
+        factor = cls.pixel_area_factor(scale_um)
+        max_area = 0.0
+        component_count = 0
+        if cv2 is not None:
+            num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+                mask_bool.astype(np.uint8),
+                connectivity=8,
+            )
+            for label_id in range(1, num_labels):
+                pixel_count = int(stats[label_id, cv2.CC_STAT_AREA])
+                max_area = max(max_area, pixel_count * factor)
+                component_count += 1
+            return max_area, component_count
+
+        for coords in cls.connected_components_bool(mask_bool, min_area=1):
+            max_area = max(max_area, len(coords) * factor)
+            component_count += 1
+        return max_area, component_count
 
     @staticmethod
     def pixel_area_factor(scale_um: float) -> float:
@@ -2508,6 +2550,9 @@ class GroupCameraFeatureExplorer:
             "jbf_morph_close": 5,
             "jbf_blur_kernel": 3,
             "jbf_threshold": 230.0,
+            "size_threshold_enabled": False,
+            "k_size_threshold": 0.0,
+            "g_size_threshold": 0.0,
         }
 
     @staticmethod
@@ -2789,6 +2834,8 @@ class GroupCameraFeatureExplorer:
         columns = [
             "group",
             "filter_alive",
+            "filter_k_alive",
+            "filter_g_alive",
             "filter_dead",
             "filter_skipped",
             "filter_eval",
@@ -2846,7 +2893,7 @@ class GroupCameraFeatureExplorer:
     def open_filter_manager(self) -> None:
         window = tk.Toplevel(self.root)
         window.title("Filter Pipeline 관리")
-        window.geometry("980x760")
+        window.geometry("1040x820")
         window.transient(self.root)
 
         outer = ttk.Frame(window, padding=10)
@@ -2892,6 +2939,9 @@ class GroupCameraFeatureExplorer:
             "jbf_morph_close": tk.IntVar(),
             "jbf_blur_kernel": tk.IntVar(),
             "jbf_threshold": tk.DoubleVar(),
+            "size_threshold_enabled": tk.BooleanVar(),
+            "k_size_threshold": tk.StringVar(),
+            "g_size_threshold": tk.StringVar(),
         }
 
         def set_vars(pipeline: dict[str, object]) -> None:
@@ -2909,6 +2959,8 @@ class GroupCameraFeatureExplorer:
             cluster_select = str(vars_map["cluster_select"].get() or "all")
             if bool(vars_map["remove_border_background"].get()):
                 cluster_select = "border_background"
+            k_size_threshold = ImageViewer.parse_nonnegative_float_text(str(vars_map["k_size_threshold"].get()))
+            g_size_threshold = ImageViewer.parse_nonnegative_float_text(str(vars_map["g_size_threshold"].get()))
             return {
                 "name": name,
                 "source": str(vars_map["source"].get() or "image_path"),
@@ -2936,6 +2988,9 @@ class GroupCameraFeatureExplorer:
                 "jbf_morph_close": int(vars_map["jbf_morph_close"].get()),
                 "jbf_blur_kernel": int(vars_map["jbf_blur_kernel"].get()),
                 "jbf_threshold": float(vars_map["jbf_threshold"].get()),
+                "size_threshold_enabled": bool(vars_map["size_threshold_enabled"].get()),
+                "k_size_threshold": float(k_size_threshold),
+                "g_size_threshold": float(g_size_threshold),
             }
 
         def unique_name(base: str) -> str:
@@ -3113,6 +3168,16 @@ class GroupCameraFeatureExplorer:
         ]:
             ttk.Label(jbf, text=label).pack(side=tk.LEFT, padx=(0, 3))
             tk.Scale(jbf, from_=0 if key in {"jbf_morph_open", "jbf_morph_close", "jbf_threshold"} else 1, to=max_value, resolution=resolution, orient=tk.HORIZONTAL, variable=vars_map[key], length=80).pack(side=tk.LEFT, padx=(0, 6))
+
+        size_threshold = ttk.LabelFrame(edit_frame, text="Visualization Size Threshold", padding=(8, 6))
+        size_threshold.grid(row=row, column=0, columnspan=2, sticky="ew", pady=4)
+        row += 1
+        ttk.Checkbutton(size_threshold, text="Use Size Threshold", variable=vars_map["size_threshold_enabled"]).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(size_threshold, text="K-Size-Threshold (mm^2)").pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Entry(size_threshold, textvariable=vars_map["k_size_threshold"], width=10).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(size_threshold, text="G-Size-Threshold (mm^2)").pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Entry(size_threshold, textvariable=vars_map["g_size_threshold"], width=10).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(size_threshold, text="Batch plot: K-Alive=green, G-Alive=yellow").pack(side=tk.LEFT)
 
         button_row = ttk.Frame(outer)
         button_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -3425,6 +3490,32 @@ class GroupCameraFeatureExplorer:
         return (MAIN_FILTER_CACHE_VERSION, self.freeze_for_cache(pipeline))
 
     @staticmethod
+    def nonnegative_float_value(value: object) -> float:
+        number = safe_float(value)
+        if not np.isfinite(number):
+            return 0.0
+        return max(float(number), 0.0)
+
+    @classmethod
+    def pipeline_size_threshold_config(cls, pipeline: dict[str, object]) -> tuple[bool, float, float]:
+        enabled = bool(pipeline.get("size_threshold_enabled", False))
+        k_threshold = cls.nonnegative_float_value(pipeline.get("k_size_threshold", 0.0))
+        g_threshold = cls.nonnegative_float_value(pipeline.get("g_size_threshold", 0.0))
+        return enabled, k_threshold, g_threshold
+
+    @staticmethod
+    def classify_size_threshold_status(max_area: float, k_threshold: float, g_threshold: float) -> str:
+        passed: list[tuple[float, str]] = []
+        if max_area > k_threshold:
+            passed.append((k_threshold, "k_alive"))
+        if max_area > g_threshold:
+            passed.append((g_threshold, "g_alive"))
+        if not passed:
+            return "dead"
+        passed.sort(key=lambda item: item[0], reverse=True)
+        return passed[0][1]
+
+    @staticmethod
     def bbox_ratio_from_mask(mask: np.ndarray) -> tuple[float, int, int]:
         mask_bool = mask.astype(bool)
         if not mask_bool.any():
@@ -3707,6 +3798,7 @@ class GroupCameraFeatureExplorer:
         valid_mask: np.ndarray,
         pipeline: dict[str, object],
         source_name: str = "",
+        scale_um: float | None = None,
     ) -> dict[str, object]:
         start = time.perf_counter()
         adjusted = ImageViewer.apply_blur(
@@ -3718,6 +3810,8 @@ class GroupCameraFeatureExplorer:
         if valid_mask.shape != (h, w):
             valid_mask = np.zeros((h, w), dtype=bool)
 
+        scale = ImageViewer.normalize_scale_um(scale_um)
+        size_threshold_enabled, k_size_threshold, g_size_threshold = self.pipeline_size_threshold_config(pipeline)
         k = int(pipeline.get("k", 1)) if bool(pipeline.get("kmeans_enabled", False)) else 1
         mode_parts: list[str] = []
         if source_name:
@@ -3748,6 +3842,10 @@ class GroupCameraFeatureExplorer:
                 "status": "dead",
                 "raw_area": 0,
                 "alive_area": 0,
+                "max_component_area_mm2": 0.0,
+                "component_count": 0,
+                "size_threshold_enabled": size_threshold_enabled,
+                "size_threshold_status": "dead",
                 "elapsed_ms": float(elapsed_ms),
                 "mode": mode_text,
                 "stats_text": stats_text,
@@ -3773,6 +3871,10 @@ class GroupCameraFeatureExplorer:
                 "status": "skipped",
                 "raw_area": raw_area,
                 "alive_area": 0,
+                "max_component_area_mm2": 0.0,
+                "component_count": 0,
+                "size_threshold_enabled": size_threshold_enabled,
+                "size_threshold_status": "skipped",
                 "elapsed_ms": float(elapsed_ms),
                 "mode": mode_text,
                 "stats_text": stats_text,
@@ -3823,14 +3925,38 @@ class GroupCameraFeatureExplorer:
             work_mask, refine_mode = self.apply_filter_refinement(work_mask, valid_mask, pipeline)
             mode_parts.append(refine_mode)
 
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        alive_area = int(work_mask.sum()) if not failed else 0
+        max_component_area = 0.0
+        component_count = 0
+        size_threshold_status = "off"
+        status = "unknown" if failed else ("alive" if alive_area > 0 else "dead")
+        if failed:
+            size_threshold_status = "unknown"
+        elif size_threshold_enabled:
+            max_component_area, component_count = ImageViewer.mask_component_area_summary(work_mask, scale)
+            size_threshold_status = self.classify_size_threshold_status(
+                max_component_area,
+                k_size_threshold,
+                g_size_threshold,
+            )
+            status = size_threshold_status
+            mode_parts.append(
+                f"size_threshold=on(K={k_size_threshold:g},G={g_size_threshold:g},"
+                f"max={max_component_area:.4g}mm2,components={component_count},status={size_threshold_status})"
+            )
+        elif not failed:
+            size_threshold_status = status
+
         refined = np.zeros((h, w, 3), dtype=np.uint8)
         if failed:
             refined[candidate] = np.array([214, 39, 40], dtype=np.uint8)
+        elif size_threshold_enabled and status == "g_alive":
+            refined[work_mask] = np.array([255, 191, 0], dtype=np.uint8)
+        elif size_threshold_enabled and status == "dead":
+            refined[work_mask] = np.array([214, 39, 40], dtype=np.uint8)
         else:
             refined[work_mask] = np.array([44, 160, 44], dtype=np.uint8)
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        alive_area = int(work_mask.sum()) if not failed else 0
-        status = "unknown" if failed else ("alive" if alive_area > 0 else "dead")
         mode_text = " | ".join(mode_parts)
         stats_text = (
             f"order={order}, raw_area={raw_area}, alive_area={alive_area}, "
@@ -3843,6 +3969,10 @@ class GroupCameraFeatureExplorer:
             "status": status,
             "raw_area": raw_area,
             "alive_area": alive_area,
+            "max_component_area_mm2": float(max_component_area),
+            "component_count": int(component_count),
+            "size_threshold_enabled": size_threshold_enabled,
+            "size_threshold_status": size_threshold_status,
             "elapsed_ms": float(elapsed_ms),
             "mode": mode_text,
             "stats_text": stats_text,
@@ -3891,6 +4021,10 @@ class GroupCameraFeatureExplorer:
                 "status": "unknown",
                 "raw_area": 0,
                 "alive_area": 0,
+                "max_component_area_mm2": 0.0,
+                "component_count": 0,
+                "size_threshold_enabled": bool(pipeline.get("size_threshold_enabled", False)),
+                "size_threshold_status": "unknown",
                 "elapsed_ms": 0.0,
                 "mode": "missing_path",
                 "cache_hit": False,
@@ -3913,6 +4047,10 @@ class GroupCameraFeatureExplorer:
                     "status": "dead",
                     "raw_area": 0,
                     "alive_area": 0,
+                    "max_component_area_mm2": 0.0,
+                    "component_count": 0,
+                    "size_threshold_enabled": bool(pipeline.get("size_threshold_enabled", False)),
+                    "size_threshold_status": "dead",
                     "elapsed_ms": 0.0,
                     "mode": "empty_mask",
                     "cache_hit": False,
@@ -3923,12 +4061,17 @@ class GroupCameraFeatureExplorer:
                     mask,
                     pipeline,
                     source_name=source_name,
+                    scale_um=self.scale_um_from_row(row),
                 )
                 result = {
                     "filter_name": filter_name,
                     "status": str(pipeline_result.get("status", "unknown")),
                     "raw_area": int(pipeline_result.get("raw_area", 0)),
                     "alive_area": int(pipeline_result.get("alive_area", 0)),
+                    "max_component_area_mm2": float(pipeline_result.get("max_component_area_mm2", 0.0)),
+                    "component_count": int(pipeline_result.get("component_count", 0)),
+                    "size_threshold_enabled": bool(pipeline_result.get("size_threshold_enabled", False)),
+                    "size_threshold_status": str(pipeline_result.get("size_threshold_status", "")),
                     "elapsed_ms": float(pipeline_result.get("elapsed_ms", 0.0)),
                     "mode": str(pipeline_result.get("mode", "")),
                     "cache_hit": False,
@@ -3939,6 +4082,10 @@ class GroupCameraFeatureExplorer:
                 "status": "unknown",
                 "raw_area": 0,
                 "alive_area": 0,
+                "max_component_area_mm2": 0.0,
+                "component_count": 0,
+                "size_threshold_enabled": bool(pipeline.get("size_threshold_enabled", False)),
+                "size_threshold_status": "unknown",
                 "elapsed_ms": 0.0,
                 "mode": f"error:{type(exc).__name__}",
                 "cache_hit": False,
@@ -4046,15 +4193,19 @@ class GroupCameraFeatureExplorer:
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         statuses = pd.Series([str(result.get("status", "unknown")) for result in self.main_filter_results.values()])
-        alive = int((statuses == "alive").sum())
+        plain_alive = int((statuses == "alive").sum())
+        k_alive = int((statuses == "k_alive").sum())
+        g_alive = int((statuses == "g_alive").sum())
+        alive = plain_alive + k_alive + g_alive
         dead = int((statuses == "dead").sum())
         skipped = int((statuses == "skipped").sum())
         unknown = int((statuses == "unknown").sum())
         self.main_filter_enable_var.set(True)
         self.refresh_plot()
+        size_text = f", k_alive={k_alive}, g_alive={g_alive}" if bool(pipeline.get("size_threshold_enabled", False)) else ""
         self.status_var.set(
             f"Filter 평가 완료 | {sampled_text} | filter={filter_name} | alive={alive}, dead={dead}, "
-            f"skipped={skipped}, unknown={unknown}, cache_hit={cache_hits}/{total}, elapsed={elapsed_ms:.1f}ms"
+            f"skipped={skipped}, unknown={unknown}{size_text}, cache_hit={cache_hits}/{total}, elapsed={elapsed_ms:.1f}ms"
         )
 
     def attach_main_filter_results(self, plot_df: pd.DataFrame) -> pd.DataFrame:
@@ -4069,6 +4220,10 @@ class GroupCameraFeatureExplorer:
         statuses = []
         raw_areas = []
         alive_areas = []
+        max_component_areas = []
+        component_counts = []
+        size_threshold_enabled_values = []
+        size_threshold_statuses = []
         modes = []
         filter_names = []
         for row_id in out["row_id"].astype(int):
@@ -4077,17 +4232,29 @@ class GroupCameraFeatureExplorer:
                 statuses.append("unknown")
                 raw_areas.append(np.nan)
                 alive_areas.append(np.nan)
+                max_component_areas.append(np.nan)
+                component_counts.append(np.nan)
+                size_threshold_enabled_values.append(False)
+                size_threshold_statuses.append("")
                 modes.append("")
                 filter_names.append("")
             else:
                 statuses.append(str(result.get("status", "unknown")))
                 raw_areas.append(result.get("raw_area", np.nan))
                 alive_areas.append(result.get("alive_area", np.nan))
+                max_component_areas.append(result.get("max_component_area_mm2", np.nan))
+                component_counts.append(result.get("component_count", np.nan))
+                size_threshold_enabled_values.append(bool(result.get("size_threshold_enabled", False)))
+                size_threshold_statuses.append(str(result.get("size_threshold_status", "")))
                 modes.append(str(result.get("mode", "")))
                 filter_names.append(str(result.get("filter_name", "")))
         out["filter_status"] = statuses
         out["filter_raw_area"] = raw_areas
         out["filter_alive_area"] = alive_areas
+        out["filter_max_component_area_mm2"] = max_component_areas
+        out["filter_component_count"] = component_counts
+        out["filter_size_threshold_enabled"] = size_threshold_enabled_values
+        out["filter_size_threshold_status"] = size_threshold_statuses
         out["filter_mode"] = modes
         out["filter_name"] = filter_names
         return out
@@ -4302,14 +4469,28 @@ class GroupCameraFeatureExplorer:
 
         filter_status = ""
         if self.main_filter_enable_var.get() and "filter_status" in plot_df.columns:
-            alive = int((plot_df["filter_status"] == "alive").sum())
+            plain_alive = int((plot_df["filter_status"] == "alive").sum())
+            k_alive = int((plot_df["filter_status"] == "k_alive").sum())
+            g_alive = int((plot_df["filter_status"] == "g_alive").sum())
+            alive = plain_alive + k_alive + g_alive
             dead = int((plot_df["filter_status"] == "dead").sum())
             skipped = int((plot_df["filter_status"] == "skipped").sum())
             unknown = int((plot_df["filter_status"] == "unknown").sum())
             evaluated = alive + dead
             scope_text = f", {self.main_filter_scope_text}" if self.main_filter_scope_text else ""
-            filter_status = f" | Filter eval={evaluated}, alive={alive}, dead={dead}, skipped={skipped}, unknown={unknown}{scope_text}"
-            self.ax.scatter([], [], s=54, facecolors="none", edgecolors=FILTER_STATUS_COLORS["alive"], linewidths=1.5, label=f"Filter Alive ({alive})")
+            size_threshold_active = bool(
+                "filter_size_threshold_enabled" in plot_df.columns
+                and plot_df["filter_size_threshold_enabled"].astype(bool).any()
+            )
+            size_status = f", k_alive={k_alive}, g_alive={g_alive}" if size_threshold_active else ""
+            filter_status = f" | Filter eval={evaluated}, alive={alive}, dead={dead}, skipped={skipped}, unknown={unknown}{size_status}{scope_text}"
+            if size_threshold_active:
+                self.ax.scatter([], [], s=54, facecolors="none", edgecolors=FILTER_STATUS_COLORS["k_alive"], linewidths=1.65, label=f"Filter-K-Alive ({k_alive})")
+                self.ax.scatter([], [], s=54, facecolors="none", edgecolors=FILTER_STATUS_COLORS["g_alive"], linewidths=1.65, label=f"Filter-G-Alive ({g_alive})")
+                if plain_alive:
+                    self.ax.scatter([], [], s=54, facecolors="none", edgecolors=FILTER_STATUS_COLORS["alive"], linewidths=1.5, label=f"Filter Alive ({plain_alive})")
+            else:
+                self.ax.scatter([], [], s=54, facecolors="none", edgecolors=FILTER_STATUS_COLORS["alive"], linewidths=1.5, label=f"Filter Alive ({alive})")
             self.ax.scatter([], [], s=54, facecolors="none", edgecolors=FILTER_STATUS_COLORS["dead"], linewidths=1.5, label=f"Filter Dead ({dead})")
             self.ax.scatter([], [], s=54, facecolors="none", edgecolors=FILTER_STATUS_COLORS["skipped"], linewidths=1.5, label=f"Filter Skipped ({skipped})")
 
@@ -4384,7 +4565,16 @@ class GroupCameraFeatureExplorer:
         for col in ["진불스크래치", "미세스크래치", "기타"]:
             if col not in summary.columns:
                 summary[col] = 0
-        for col in ["filter_eval", "filter_alive", "filter_dead", "filter_skipped", "filter_unknown", "filter_alive_rate"]:
+        for col in [
+            "filter_eval",
+            "filter_alive",
+            "filter_k_alive",
+            "filter_g_alive",
+            "filter_dead",
+            "filter_skipped",
+            "filter_unknown",
+            "filter_alive_rate",
+        ]:
             summary[col] = np.nan
         if "filter_status" in plot_df.columns:
             filter_counts = (
@@ -4398,12 +4588,30 @@ class GroupCameraFeatureExplorer:
                 .reset_index()
                 .rename_axis(None, axis=1)
             )
-            summary = summary.drop(columns=["filter_eval", "filter_alive", "filter_dead", "filter_skipped", "filter_unknown", "filter_alive_rate"], errors="ignore")
+            summary = summary.drop(
+                columns=[
+                    "filter_eval",
+                    "filter_alive",
+                    "filter_k_alive",
+                    "filter_g_alive",
+                    "filter_dead",
+                    "filter_skipped",
+                    "filter_unknown",
+                    "filter_alive_rate",
+                ],
+                errors="ignore",
+            )
             summary = summary.merge(filter_counts, on=["group", "camera_mode"], how="left")
-            for status in ["alive", "dead", "skipped", "unknown"]:
+            for status in ["alive", "k_alive", "g_alive", "dead", "skipped", "unknown"]:
                 if status not in summary.columns:
                     summary[status] = 0
-            summary["filter_alive"] = pd.to_numeric(summary["alive"], errors="coerce").fillna(0).astype(int)
+            summary["filter_k_alive"] = pd.to_numeric(summary["k_alive"], errors="coerce").fillna(0).astype(int)
+            summary["filter_g_alive"] = pd.to_numeric(summary["g_alive"], errors="coerce").fillna(0).astype(int)
+            summary["filter_alive"] = (
+                pd.to_numeric(summary["alive"], errors="coerce").fillna(0).astype(int)
+                + summary["filter_k_alive"]
+                + summary["filter_g_alive"]
+            )
             summary["filter_dead"] = pd.to_numeric(summary["dead"], errors="coerce").fillna(0).astype(int)
             summary["filter_skipped"] = pd.to_numeric(summary["skipped"], errors="coerce").fillna(0).astype(int)
             summary["filter_unknown"] = pd.to_numeric(summary["unknown"], errors="coerce").fillna(0).astype(int)
@@ -4445,6 +4653,8 @@ class GroupCameraFeatureExplorer:
             values = [
                 row["group"],
                 "" if pd.isna(row.get("filter_alive", np.nan)) else int(row.get("filter_alive", 0)),
+                "" if pd.isna(row.get("filter_k_alive", np.nan)) else int(row.get("filter_k_alive", 0)),
+                "" if pd.isna(row.get("filter_g_alive", np.nan)) else int(row.get("filter_g_alive", 0)),
                 "" if pd.isna(row.get("filter_dead", np.nan)) else int(row.get("filter_dead", 0)),
                 "" if pd.isna(row.get("filter_skipped", np.nan)) else int(row.get("filter_skipped", 0)),
                 "" if pd.isna(row.get("filter_eval", np.nan)) else int(row.get("filter_eval", 0)),
@@ -4524,7 +4734,9 @@ class GroupCameraFeatureExplorer:
                 mode_text = mode_text[:217] + "..."
             meta += (
                 f"\nfilter={filter_result.get('filter_name', '')} | status={filter_result.get('status', '')} | "
-                f"raw={filter_result.get('raw_area', '')} | alive={filter_result.get('alive_area', '')} | {mode_text}"
+                f"raw={filter_result.get('raw_area', '')} | alive={filter_result.get('alive_area', '')} | "
+                f"max_component={filter_result.get('max_component_area_mm2', '')}mm^2 | "
+                f"components={filter_result.get('component_count', '')} | {mode_text}"
             )
 
         image_paths: dict[str, Path] = {}

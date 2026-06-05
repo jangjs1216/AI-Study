@@ -11,6 +11,7 @@ Optional:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
 import sys
@@ -70,6 +71,7 @@ DEFECT_COLORS = {
 
 MAIN_FILTER_CACHE_VERSION = "main_filter_v3"
 DEFAULT_PIXEL_SCALE_UM = 13.0
+UI_STATE_PATH = Path(__file__).with_name("08_group_camera_feature_ui_state.json")
 OPENCV_JBF_INSTALL_HINT = "OpenCV Joint Bilateral Filter는 opencv-contrib-python의 cv2.ximgproc가 필요합니다."
 
 KOREAN_FONT_CANDIDATES = [
@@ -169,7 +171,9 @@ class ImageViewer:
         self.refined_image_label: ttk.Label | None = None
         self.cluster_stats_label: ttk.Label | None = None
         self.size_filtering_check: ttk.Checkbutton | None = None
-        self.size_threshold_entry: ttk.Entry | None = None
+        self.color_filtering_check: ttk.Checkbutton | None = None
+        self.k_size_threshold_entry: ttk.Entry | None = None
+        self.g_size_threshold_entry: ttk.Entry | None = None
         self.adjusted_photo: ImageTk.PhotoImage | None = None
         self.cluster_photo: ImageTk.PhotoImage | None = None
         self.refined_photo: ImageTk.PhotoImage | None = None
@@ -212,7 +216,9 @@ class ImageViewer:
         self.jbf_threshold_var = tk.DoubleVar(value=230.0)
         self.size_measurement_var = tk.BooleanVar(value=False)
         self.size_filtering_var = tk.BooleanVar(value=False)
-        self.size_threshold_var = tk.StringVar(value="0")
+        self.color_filtering_var = tk.BooleanVar(value=False)
+        self.k_size_threshold_var = tk.StringVar(value="0")
+        self.g_size_threshold_var = tk.StringVar(value="0")
 
     def _ensure_window(self) -> None:
         if self.window is not None and self.window.winfo_exists():
@@ -363,11 +369,22 @@ class ImageViewer:
             command=self.on_size_filtering_toggle,
         )
         self.size_filtering_check.pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Label(visualization_row, text="Size-Threshold (mm^2)").pack(side=tk.LEFT, padx=(0, 4))
-        self.size_threshold_entry = ttk.Entry(visualization_row, textvariable=self.size_threshold_var, width=10)
-        self.size_threshold_entry.pack(side=tk.LEFT, padx=(0, 12))
-        self.size_threshold_entry.bind("<KeyRelease>", lambda _event: self.schedule_render())
-        self.size_threshold_entry.bind("<FocusOut>", lambda _event: self.schedule_render())
+        self.color_filtering_check = ttk.Checkbutton(
+            visualization_row,
+            text="Color-Filtering",
+            variable=self.color_filtering_var,
+            command=self.on_color_filtering_toggle,
+        )
+        self.color_filtering_check.pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Label(visualization_row, text="K-Size-Threshold (mm^2)").pack(side=tk.LEFT, padx=(0, 4))
+        self.k_size_threshold_entry = ttk.Entry(visualization_row, textvariable=self.k_size_threshold_var, width=10)
+        self.k_size_threshold_entry.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(visualization_row, text="G-Size-Threshold (mm^2)").pack(side=tk.LEFT, padx=(0, 4))
+        self.g_size_threshold_entry = ttk.Entry(visualization_row, textvariable=self.g_size_threshold_var, width=10)
+        self.g_size_threshold_entry.pack(side=tk.LEFT, padx=(0, 12))
+        for threshold_entry in [self.k_size_threshold_entry, self.g_size_threshold_entry]:
+            threshold_entry.bind("<KeyRelease>", lambda _event: self.schedule_render())
+            threshold_entry.bind("<FocusOut>", lambda _event: self.schedule_render())
         ttk.Label(visualization_row, text="area = pixels * (scale / 1000)^2").pack(side=tk.LEFT)
         self.update_size_controls_state()
 
@@ -582,23 +599,33 @@ class ImageViewer:
 
     def update_size_controls_state(self) -> None:
         measurement_enabled = bool(self.size_measurement_var.get())
-        filtering_enabled = measurement_enabled and bool(self.size_filtering_var.get())
+        color_filtering_enabled = bool(self.color_filtering_var.get())
+        size_filtering_enabled = measurement_enabled and bool(self.size_filtering_var.get()) and not color_filtering_enabled
         if self.size_filtering_check is not None:
-            if measurement_enabled:
+            if measurement_enabled and not color_filtering_enabled:
                 self.size_filtering_check.state(["!disabled"])
             else:
                 self.size_filtering_check.state(["disabled"])
-        if self.size_threshold_entry is not None:
-            if filtering_enabled:
-                self.size_threshold_entry.state(["!disabled"])
+        if self.color_filtering_check is not None:
+            self.color_filtering_check.state(["!disabled"])
+        threshold_enabled = size_filtering_enabled or color_filtering_enabled
+        for threshold_entry in [self.k_size_threshold_entry, self.g_size_threshold_entry]:
+            if threshold_entry is None:
+                continue
+            if threshold_enabled:
+                threshold_entry.state(["!disabled"])
             else:
-                self.size_threshold_entry.state(["disabled"])
+                threshold_entry.state(["disabled"])
 
     def on_size_measurement_toggle(self) -> None:
         self.update_size_controls_state()
         self.schedule_render()
 
     def on_size_filtering_toggle(self) -> None:
+        self.update_size_controls_state()
+        self.schedule_render()
+
+    def on_color_filtering_toggle(self) -> None:
         self.update_size_controls_state()
         self.schedule_render()
 
@@ -709,7 +736,9 @@ class ImageViewer:
         self.jbf_threshold_var.set(230.0)
         self.size_measurement_var.set(False)
         self.size_filtering_var.set(False)
-        self.size_threshold_var.set("0")
+        self.color_filtering_var.set(False)
+        self.k_size_threshold_var.set("0")
+        self.g_size_threshold_var.set("0")
         self.update_size_controls_state()
         self.overlap_var.set(False)
         self.active_filter_pipeline = None
@@ -803,8 +832,9 @@ class ImageViewer:
             self.window.after_cancel(self.render_after_id)
         self.render_after_id = self.window.after(120, self.render_images)
 
-    def parse_size_threshold(self) -> float:
-        raw = self.size_threshold_var.get().strip()
+    @staticmethod
+    def parse_nonnegative_float_text(raw: str) -> float:
+        raw = raw.strip()
         if not raw:
             return 0.0
         try:
@@ -814,6 +844,13 @@ class ImageViewer:
         if not np.isfinite(value):
             return 0.0
         return max(value, 0.0)
+
+    def parse_size_thresholds(self) -> tuple[float, float]:
+        k_threshold = self.parse_nonnegative_float_text(self.k_size_threshold_var.get())
+        g_threshold = self.parse_nonnegative_float_text(self.g_size_threshold_var.get())
+        if g_threshold < k_threshold:
+            k_threshold, g_threshold = g_threshold, k_threshold
+        return k_threshold, g_threshold
 
     def render_images(self) -> None:
         self.render_after_id = None
@@ -828,8 +865,11 @@ class ImageViewer:
         angle_enabled = bool(self.refine_angle_var.get())
         ratio_enabled = bool(self.refine_ratio_var.get())
         size_measurement_enabled = bool(self.size_measurement_var.get())
-        size_filtering_enabled = size_measurement_enabled and bool(self.size_filtering_var.get())
-        size_threshold = self.parse_size_threshold()
+        color_filtering_enabled = bool(self.color_filtering_var.get())
+        size_filtering_enabled = (
+            size_measurement_enabled and bool(self.size_filtering_var.get()) and not color_filtering_enabled
+        )
+        k_size_threshold, g_size_threshold = self.parse_size_thresholds()
         if self.active_filter_pipeline is not None and self.pipeline_preview_renderer is not None:
             pipeline = self.active_pipeline_from_controls()
             adjusted, clustered, refined, stats_text = self.pipeline_preview_renderer(base, self.mask_array, pipeline)
@@ -863,23 +903,46 @@ class ImageViewer:
             )
         size_stats_text = ""
         size_filter_stats_text = ""
-        if size_filtering_enabled:
+        clustered_measurement_source = clustered
+        refined_measurement_source = refined
+        if color_filtering_enabled:
+            clustered, cluster_color_text = self.apply_color_filter_to_result(
+                clustered,
+                scale_um=self.current_scale_um,
+                k_threshold_area=k_size_threshold,
+                g_threshold_area=g_size_threshold,
+            )
+            refined, refine_color_text = self.apply_color_filter_to_result(
+                refined,
+                scale_um=self.current_scale_um,
+                k_threshold_area=k_size_threshold,
+                g_threshold_area=g_size_threshold,
+            )
+            size_filter_stats_text = (
+                f", color=on(K={k_size_threshold:g}mm^2, G={g_size_threshold:g}mm^2, "
+                f"K-Means {cluster_color_text}, Refinement {refine_color_text})"
+            )
+        elif size_filtering_enabled:
             clustered, cluster_size_text = self.apply_size_filter_to_result(
                 clustered,
                 scale_um=self.current_scale_um,
-                threshold_area=size_threshold,
+                threshold_area=k_size_threshold,
             )
             refined, refine_size_text = self.apply_size_filter_to_result(
                 refined,
                 scale_um=self.current_scale_um,
-                threshold_area=size_threshold,
+                threshold_area=k_size_threshold,
             )
+            clustered_measurement_source = clustered
+            refined_measurement_source = refined
             size_filter_stats_text = (
-                f", filter=on(th={size_threshold:g}mm^2, "
+                f", filter=on(K={k_size_threshold:g}mm^2, "
                 f"K-Means {cluster_size_text}, Refinement {refine_size_text})"
             )
         elif size_measurement_enabled:
             size_stats_text = f" | size_measure=on, scale={self.current_scale_um:g}um/px"
+        if color_filtering_enabled and not size_measurement_enabled:
+            size_stats_text = f" | size_color=on, scale={self.current_scale_um:g}um/px{size_filter_stats_text}"
         if self.overlap_var.get():
             clustered_display = self.overlay_result(adjusted, clustered, alpha=0.8)
             refined_display = self.overlay_result(adjusted, refined, alpha=0.8)
@@ -901,16 +964,16 @@ class ImageViewer:
         if size_measurement_enabled:
             clustered_display, cluster_label_text = self.draw_size_measurement_overlay(
                 clustered_display,
-                clustered,
+                clustered_measurement_source,
                 scale_um=self.current_scale_um,
-                threshold_area=size_threshold,
+                threshold_area=k_size_threshold,
                 filter_enabled=size_filtering_enabled,
             )
             refined_display, refine_label_text = self.draw_size_measurement_overlay(
                 refined_display,
-                refined,
+                refined_measurement_source,
                 scale_um=self.current_scale_um,
-                threshold_area=size_threshold,
+                threshold_area=k_size_threshold,
                 filter_enabled=size_filtering_enabled,
             )
             size_stats_text = (
@@ -1100,6 +1163,63 @@ class ImageViewer:
         filtered = array.copy()
         filtered[nonzero & ~keep_mask] = 0
         return filtered, f"kept={kept_components}/{total_components}"
+
+    @staticmethod
+    def grade_color_for_area(
+        area: float,
+        k_threshold_area: float,
+        g_threshold_area: float,
+    ) -> tuple[tuple[int, int, int], str]:
+        if area > g_threshold_area:
+            return (44, 160, 44), "green"
+        if area >= k_threshold_area:
+            return (255, 205, 0), "yellow"
+        return (214, 39, 40), "red"
+
+    @classmethod
+    def apply_color_filter_to_result(
+        cls,
+        array: np.ndarray,
+        scale_um: float,
+        k_threshold_area: float,
+        g_threshold_area: float,
+    ) -> tuple[np.ndarray, str]:
+        k_threshold = max(float(k_threshold_area), 0.0)
+        g_threshold = max(float(g_threshold_area), 0.0)
+        if g_threshold < k_threshold:
+            k_threshold, g_threshold = g_threshold, k_threshold
+        factor = cls.pixel_area_factor(scale_um)
+        out = np.zeros_like(array, dtype=np.uint8)
+        counts = {"green": 0, "yellow": 0, "red": 0}
+        total_components = 0
+
+        for group_mask in cls.result_component_group_masks(array):
+            if cv2 is not None:
+                num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+                    group_mask.astype(np.uint8),
+                    connectivity=8,
+                )
+                for label_id in range(1, num_labels):
+                    pixel_count = int(stats[label_id, cv2.CC_STAT_AREA])
+                    area = pixel_count * factor
+                    color, grade = cls.grade_color_for_area(area, k_threshold, g_threshold)
+                    out[labels == label_id] = np.asarray(color, dtype=np.uint8)
+                    counts[grade] += 1
+                    total_components += 1
+                continue
+
+            for coords in cls.connected_components_bool(group_mask, min_area=1):
+                pixel_count = int(len(coords))
+                area = pixel_count * factor
+                color, grade = cls.grade_color_for_area(area, k_threshold, g_threshold)
+                out[coords[:, 0], coords[:, 1]] = np.asarray(color, dtype=np.uint8)
+                counts[grade] += 1
+                total_components += 1
+
+        return (
+            out,
+            f"green={counts['green']}, yellow={counts['yellow']}, red={counts['red']}, total={total_components}",
+        )
 
     @classmethod
     def draw_size_measurement_overlay(
@@ -2292,7 +2412,8 @@ class GroupCameraFeatureExplorer:
         self.main_filter_mask_cache_limit = 512
         self.main_filter_scope_text = ""
         self.filter_rate_ax = None
-        self.filter_pipelines: list[dict[str, object]] = [self.default_filter_pipeline()]
+        self.ui_state = self.load_ui_state()
+        self.filter_pipelines: list[dict[str, object]] = self.load_filter_pipelines_from_state(self.ui_state)
         self.image_viewer = ImageViewer(
             root,
             filter_pipeline_provider=self.selected_filter_pipeline,
@@ -2312,15 +2433,16 @@ class GroupCameraFeatureExplorer:
         self.formula_text_var = tk.StringVar(value="항을 추가하세요.")
         self.threshold_var = tk.StringVar()
         self.threshold_direction_var = tk.StringVar(value="상단 제거 (>=)")
-        self.main_filter_enable_var = tk.BooleanVar(value=False)
-        self.main_filter_pipeline_var = tk.StringVar(value=str(self.filter_pipelines[0]["name"]))
-        self.main_filter_sample_size_var = tk.StringVar(value="500")
-        self.main_filter_seed_var = tk.StringVar(value="17")
-        self.main_filter_group_balanced_var = tk.BooleanVar(value=False)
-        self.main_filter_rate_line_var = tk.BooleanVar(value=False)
+        self.main_filter_enable_var = tk.BooleanVar(value=bool(self.ui_state.get("main_filter_enable", False)))
+        self.main_filter_pipeline_var = tk.StringVar(value=self.initial_filter_pipeline_name(self.ui_state))
+        self.main_filter_sample_size_var = tk.StringVar(value=str(self.ui_state.get("main_filter_sample_size", "500")))
+        self.main_filter_seed_var = tk.StringVar(value=str(self.ui_state.get("main_filter_seed", "17")))
+        self.main_filter_group_balanced_var = tk.BooleanVar(value=bool(self.ui_state.get("main_filter_group_balanced", False)))
+        self.main_filter_rate_line_var = tk.BooleanVar(value=bool(self.ui_state.get("main_filter_rate_line", False)))
         self.status_var = tk.StringVar(value="CSV를 로드하세요.")
 
         self._build_layout()
+        self.bind_main_filter_state_traces()
         if csv_path is not None:
             self.load_csv(csv_path)
 
@@ -2375,6 +2497,97 @@ class GroupCameraFeatureExplorer:
             "jbf_threshold": 230.0,
         }
 
+    @staticmethod
+    def load_ui_state() -> dict[str, object]:
+        if not UI_STATE_PATH.exists():
+            return {}
+        try:
+            payload = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - ignore broken local state and use defaults
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @classmethod
+    def normalize_filter_pipeline_state(cls, pipeline: object, fallback_name: str) -> dict[str, object] | None:
+        if not isinstance(pipeline, dict):
+            return None
+        name = str(pipeline.get("name", fallback_name)).strip() or fallback_name
+        merged = cls.default_filter_pipeline(name)
+        for key in merged:
+            if key in pipeline:
+                merged[key] = pipeline[key]
+        merged["name"] = name
+        return merged
+
+    @classmethod
+    def load_filter_pipelines_from_state(cls, state: dict[str, object]) -> list[dict[str, object]]:
+        raw_pipelines = state.get("filter_pipelines", [])
+        pipelines: list[dict[str, object]] = []
+        if isinstance(raw_pipelines, list):
+            for idx, raw_pipeline in enumerate(raw_pipelines, start=1):
+                pipeline = cls.normalize_filter_pipeline_state(raw_pipeline, f"Pipeline {idx}")
+                if pipeline is not None:
+                    pipelines.append(pipeline)
+        if not pipelines:
+            pipelines = [cls.default_filter_pipeline()]
+
+        seen: set[str] = set()
+        for pipeline in pipelines:
+            base = str(pipeline.get("name", "Pipeline")).strip() or "Pipeline"
+            name = base
+            suffix = 2
+            while name in seen:
+                name = f"{base} {suffix}"
+                suffix += 1
+            pipeline["name"] = name
+            seen.add(name)
+        return pipelines
+
+    def initial_filter_pipeline_name(self, state: dict[str, object]) -> str:
+        names = self.filter_pipeline_names()
+        selected = str(state.get("selected_filter_pipeline", ""))
+        if selected in names:
+            return selected
+        return names[0] if names else str(self.default_filter_pipeline()["name"])
+
+    def save_ui_state(self) -> None:
+        payload = {
+            "version": 1,
+            "filter_pipelines": self.filter_pipelines,
+            "selected_filter_pipeline": self.main_filter_pipeline_var.get(),
+            "main_filter_enable": bool(self.main_filter_enable_var.get()),
+            "main_filter_sample_size": self.main_filter_sample_size_var.get(),
+            "main_filter_seed": self.main_filter_seed_var.get(),
+            "main_filter_group_balanced": bool(self.main_filter_group_balanced_var.get()),
+            "main_filter_rate_line": bool(self.main_filter_rate_line_var.get()),
+        }
+        try:
+            UI_STATE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:  # noqa: BLE001 - local state persistence must not break analysis
+            return
+
+    def bind_main_filter_state_traces(self) -> None:
+        for variable in [self.main_filter_enable_var, self.main_filter_rate_line_var]:
+            variable.trace_add("write", lambda *_args: self.save_ui_state())
+        for variable in [
+            self.main_filter_pipeline_var,
+            self.main_filter_sample_size_var,
+            self.main_filter_seed_var,
+            self.main_filter_group_balanced_var,
+        ]:
+            variable.trace_add("write", lambda *_args: self.invalidate_main_filter_results())
+
+    def on_main_filter_settings_changed(self, refresh: bool = True) -> None:
+        self.save_ui_state()
+        if refresh:
+            self.refresh_plot()
+
+    def invalidate_main_filter_results(self, refresh: bool = True) -> None:
+        self.save_ui_state()
+        self.clear_main_filter_state(clear_arrays=False)
+        if refresh:
+            self.refresh_plot()
+
     def filter_pipeline_names(self) -> list[str]:
         return [str(pipeline.get("name", "")) for pipeline in self.filter_pipelines]
 
@@ -2398,6 +2611,7 @@ class GroupCameraFeatureExplorer:
             self.main_filter_combo["values"] = names
         if self.main_filter_pipeline_var.get() not in names and names:
             self.main_filter_pipeline_var.set(names[0])
+        self.save_ui_state()
         self.clear_main_filter_state(clear_arrays=False)
         self.refresh_plot()
 
@@ -2509,7 +2723,7 @@ class GroupCameraFeatureExplorer:
             main_filter_top,
             text="Filter 결과 표시",
             variable=self.main_filter_enable_var,
-            command=self.refresh_plot,
+            command=self.on_main_filter_settings_changed,
         ).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(main_filter_top, text="Filter").pack(side=tk.LEFT, padx=(0, 4))
         self.main_filter_combo = ttk.Combobox(
@@ -2520,7 +2734,7 @@ class GroupCameraFeatureExplorer:
             values=self.filter_pipeline_names(),
         )
         self.main_filter_combo.pack(side=tk.LEFT, padx=(0, 6))
-        self.main_filter_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_plot())
+        self.main_filter_combo.bind("<<ComboboxSelected>>", lambda _event: self.invalidate_main_filter_results())
         ttk.Button(main_filter_top, text="Filter 관리...", command=self.open_filter_manager).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(main_filter_top, text="Filter 적용/갱신", command=self.apply_main_filter_batch).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(main_filter_top, text="Sample rows(0=all)").pack(side=tk.LEFT, padx=(0, 4))
@@ -2536,7 +2750,7 @@ class GroupCameraFeatureExplorer:
             main_filter_top,
             text="Filter Alive Checker",
             variable=self.main_filter_rate_line_var,
-            command=self.refresh_plot,
+            command=self.on_main_filter_settings_changed,
         ).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Label(main_filter_top, text="현재 Group/Camera 필터 대상에서 샘플링 후 Alive/Dead 평가").pack(side=tk.LEFT)
 
@@ -2738,6 +2952,7 @@ class GroupCameraFeatureExplorer:
             pipeline["cluster_select"] = "darkest"
             pipeline["refine_enabled"] = True
             self.filter_pipelines.append(pipeline)
+            self.save_ui_state()
             refresh_list(len(self.filter_pipelines) - 1)
 
         def copy_pipeline() -> None:
@@ -2747,6 +2962,7 @@ class GroupCameraFeatureExplorer:
             pipeline = deepcopy(self.filter_pipelines[idx])
             pipeline["name"] = unique_name(f"{pipeline.get('name', 'Pipeline')} Copy")
             self.filter_pipelines.append(pipeline)
+            self.save_ui_state()
             refresh_list(len(self.filter_pipelines) - 1)
 
         def save_pipeline() -> None:
@@ -4255,11 +4471,21 @@ class GroupCameraFeatureExplorer:
     def show_row_image(self, row: pd.Series) -> None:
         feature = self.feature_var.get()
         value = row.get(feature, "")
+        row_id = int(row.get("row_id"))
         meta = (
             f"row_id={row.get('row_id')} | component_id={row.get('component_id', '')} | "
             f"group={row.get('group')} | camera={row.get('camera_mode')} | "
             f"defect_type={row.get('defect_type')} | {feature}={self.format_number(value)}"
         )
+        filter_result = self.main_filter_results.get(row_id)
+        if filter_result is not None:
+            mode_text = str(filter_result.get("mode", ""))
+            if len(mode_text) > 220:
+                mode_text = mode_text[:217] + "..."
+            meta += (
+                f"\nfilter={filter_result.get('filter_name', '')} | status={filter_result.get('status', '')} | "
+                f"raw={filter_result.get('raw_area', '')} | alive={filter_result.get('alive_area', '')} | {mode_text}"
+            )
 
         image_paths: dict[str, Path] = {}
         missing_sources: list[str] = []
